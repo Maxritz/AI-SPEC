@@ -42,8 +42,9 @@ from the model definition.
 | Native lower-layer I/O: Linux io_uring (raw syscalls, no liburing) and Windows IOCP behind `io.backend`; transfer workers, expert payload reads and trunk loads go through the selected reader | implemented | Verified (host, Linux 6.1): `io` suite, 740 checks, including concurrent random reads, short-read and missing-file errors, native-versus-portable byte equality, and the engine reporting io_uring; ThreadSanitizer clean. IOCP: compiled for `x86_64-windows-gnu` with `-Werror` (Zig), not executed on Windows |
 | HTTP server: generation, SSE streaming, sessions, suspend/resume, cancellation, bearer auth, limits, metrics | implemented | Verified (host): `server` (28 checks); Verified (manual) with `curl` on `kanjoos serve` |
 | `kanjoos generate`, `serve`, `doctor` | implemented | Verified (manual) |
+| Measurement tooling: `kanjoos bench` (throughput, time to first token, per-token latency, drafter acceptance) and `kanjoos ppl` (teacher-forced NLL and perplexity) | implemented | Verified (host): `model` checks `Engine::score` against the double-precision reference; both commands run on the synthetic fixture. Results in `docs/measurements/` are labelled as synthetic |
 | Windows build | not run | `BUILD.md` lists the known Windows code paths |
-| Real model files, quality numbers, performance numbers | not measured | no model files or GPU were available |
+| Real model files, quality numbers, performance numbers, acceptance on real drafters | not measured | no real weights (Hugging Face unreachable) and no GPU; the tooling is ready (see `docs/measurements/README.md`) |
 | AddressSanitizer and UndefinedBehaviorSanitizer (`KNJ_SANITIZE=ON`, Debug) | all 8 suites pass with no sanitizer reports | Verified (host) |
 
 ## Known limitations that affect correctness claims
@@ -77,3 +78,19 @@ from the model definition.
 - Queue limits apply at request admission. A streaming response keeps its
   connection after admission, so long streams are bounded by `server.max_sessions`
   and the session TTL rather than by the queue counter.
+
+## Open items
+
+These are not implemented in this tree. The architecture allow-list refuses them with
+`Unsupported`, so nothing runs with a guessed forward pass.
+
+- **Recurrent (gated-delta-net and similar), hybrid attention/recurrent stacks, and
+  DSV4.** Each needs a new tensor schema, a reference implementation for the synthetic
+  fixture, and runtime support. Recurrent layers also need a separate state array with
+  its own budget (`docs/02-components.md`, C14), and hybrid prefixes need replay-suffix
+  rollback instead of prefix reuse (C12). DSV4 adds hyper-connections, sinkhorn routing
+  and compressed attention. None of this has been started in the tree.
+- **Real-model and GPU measurements.** Blocked by the sandbox (no weights, no GPU). The
+  tooling is complete and documented.
+- **Windows execution.** The IOCP reader compiles for Windows with Zig but has not run.
+

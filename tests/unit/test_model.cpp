@@ -68,6 +68,28 @@ void forward_matches_reference(const synth::Model& model, const std::string& pat
     CHECK(g->finish_reason == "length");
 }
 
+// Teacher-forced scoring (the quality tool's primitive) equals the double-precision reference's
+// log-likelihoods, both with a single chunk and with a chunk size that splits the sequence.
+void scoring_matches_reference(const synth::Model& model, const std::string& path, const std::string& dir) {
+    refm::Reference reference(model);
+    const std::vector<int32_t> tokens = {4, 9, 13, 2, 27, 8, 8, 19, 30, 1, 5, 11, 17, 3, 21, 6, 12, 25, 7};
+    const auto rows = reference.logits(tokens);
+    std::vector<double> expected;
+    for (size_t i = 0; i + 1 < tokens.size(); ++i) {
+        const auto& row = rows[i];
+        double maximum = *std::max_element(row.begin(), row.end()), sum = 0;
+        for (double z : row) sum += std::exp(z - maximum);
+        expected.push_back(maximum + std::log(sum) - row[size_t(tokens[i + 1])]);
+    }
+    inference::Engine engine(path, make_config(dir));
+    for (uint32_t chunk : {uint32_t(64), uint32_t(5)}) {
+        const auto nll = engine.score(tokens, chunk);
+        CHECK(nll.size() == tokens.size() - 1);
+        for (size_t i = 0; i < nll.size(); ++i) CHECK(std::abs(nll[i] - expected[i]) <= 2e-3 * (1 + std::abs(expected[i])));
+    }
+    test::throws([&] { engine.score({4}); });
+}
+
 void expert_eviction_and_kv_demotion(const synth::Model& model, const std::string& path, const std::string& dir) {
     refm::Reference reference(model);
     const std::vector<int32_t> prompt = {6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25};
@@ -251,6 +273,7 @@ int main() {
         sampler_and_spec_contracts();
         cpu_fallback_matches_reference();
         forward_matches_reference(plain, dir + "/plain.gguf", dir);
+        scoring_matches_reference(plain, dir + "/plain.gguf", dir);
         expert_eviction_and_kv_demotion(plain, dir + "/plain.gguf", dir);
         prefix_reuse_is_exact(plain, dir + "/plain.gguf", dir);
         checkpoint_resume_is_exact(plain, dir + "/plain.gguf", dir);

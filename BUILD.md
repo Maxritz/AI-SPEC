@@ -97,6 +97,18 @@ keys are errors. The keys most people need:
   requires `Authorization: Bearer <token>`), `server.max_sessions`,
   `server.max_queued`, `server.max_body_bytes`, `server.session_ttl_seconds`
 
+## Measuring
+
+- `kanjoos bench --model FILE [--prompt-tokens N] [--new-tokens N] [--repeat R] [--drafter FILE --draft-max N] [--json]`
+  reports prefill and decode throughput, time to first token, per-token latency
+  percentiles and, with a drafter, the acceptance rate. Prefix reuse is disabled so
+  prefill is measured.
+- `kanjoos ppl --model FILE --text FILE [--max-tokens N] [--chunk N] [--json]` reports the
+  teacher-forced negative log-likelihood, perplexity and bits per token of a text file.
+
+Both print the model source and the host. A model whose `general.name` starts with
+`knj-synthetic` is labelled as a synthetic fixture. See `docs/measurements/README.md`.
+
 ## HTTP API (summary)
 
 | method and path | purpose |

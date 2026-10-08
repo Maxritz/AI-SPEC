@@ -1,6 +1,7 @@
 #pragma once
 #include "core/budget.h"
 #include "inference/sampler.h"
+#include "io/reader.h"
 #include "kv/radix.h"
 #include "model/model.h"
 #include "spec/controller.h"
@@ -11,6 +12,8 @@
 namespace knj::inference {
 struct Options {
     Sampling sampling; uint32_t max_new_tokens = 128; bool allow_spill = false, allow_truncate = false, speculate = true;
+    // Measurement only: keep generating through end-of-generation tokens so every run has the requested length.
+    bool ignore_eos = false;
     double max_wire_ms = 0; uint64_t deadline_ns = 0; std::vector<std::string> stop;
     void validate() const;
 };
@@ -29,6 +32,9 @@ public:
     Engine(const std::string& model_path, Config = {}, int device_index = 0);
     ~Engine();
     std::shared_ptr<Generation> create(std::vector<int32_t>, Options = {}, const std::string& tenant = "local");
+    // Teacher-forced scoring on the generation forward path: value i is -log p(tokens[i+1] | tokens[0..i]) in nats.
+    // Uses no prefix reuse and no drafting, so every position's logits come from this call.
+    std::vector<double> score(const std::vector<int32_t>& tokens, uint32_t chunk = 64);
     std::vector<int32_t> step(Generation&);
     void suspend(Generation&, const std::string& checkpoint);
     std::shared_ptr<Generation> resume(const std::string& checkpoint, uint32_t additional_tokens, const std::string& tenant = "local");
@@ -43,6 +49,8 @@ public:
     void pressure();
     bool has_mtp() const { return spec_.mtp_layers != 0 && !drafter_; }
     bool has_drafter() const { return drafter_ != nullptr; }
+    bool backend_is_gpu() const { return backend_->caps().is_gpu; }
+    io::Capabilities io_capabilities() const;
     const profile::Counters& counters() const { return profile_.counters; }
 private:
     Config config_; gguf::ModelIndex index_; model::Spec spec_; std::shared_ptr<device::Backend> backend_; profile::Profiler profile_; Runtime runtime_; Profile budget_;
@@ -50,6 +58,7 @@ private:
     std::unique_ptr<store::ExpertStore> store_; std::unique_ptr<gpu::SlotPool> slots_; std::unique_ptr<residency::Manager> residency_; std::unique_ptr<compute::CpuFallback> fallback_; std::unique_ptr<compute::ExpertExecutor> executor_; std::unique_ptr<residency::Predictor> predictor_;
     std::unique_ptr<tokenizer::Tokenizer> tokenizer_; std::unique_ptr<model::Model> model_; std::unique_ptr<dflash::Drafter> drafter_; uint32_t drafter_max_ = 0; std::unique_ptr<kv::Cache> cache_, mtp_cache_; std::unique_ptr<kv::RadixIndex> prefixes_; std::unique_ptr<attn::Attention> attention_, mtp_attention_; std::unique_ptr<Autotuner> tuner_;
     spec::WidthController speculation_; double h2d_bytes_s_ = 0; uint64_t last_pressure_ = 0; uint32_t recent_limit_ = 0;
+    std::shared_ptr<Generation> create_session(std::vector<int32_t>, Options, const std::string& tenant, bool reuse_prefix);
     void index_result(Generation&, uint32_t start, const model::Result&);
     void remember(Generation&, uint32_t start, const model::Result&);
     void forget_from(Generation&, uint32_t position);

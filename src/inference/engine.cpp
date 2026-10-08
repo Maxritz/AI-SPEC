@@ -95,7 +95,11 @@ Engine::~Engine() {
     if (!config_.profile_dir.empty()) { profile_.write(config_.profile_dir); }
 }
 std::string Engine::model_id() const { auto name = model::meta_string(index_, "general.name"); return name.empty() ? spec_.architecture + "-" + index_.fingerprint.substr(0, 12) : name; }
+io::Capabilities Engine::io_capabilities() const { return transfers_->io_capabilities(); }
 std::shared_ptr<Generation> Engine::create(std::vector<int32_t> prompt, Options options, const std::string& tenant) {
+    return create_session(std::move(prompt), std::move(options), tenant, true);
+}
+std::shared_ptr<Generation> Engine::create_session(std::vector<int32_t> prompt, Options options, const std::string& tenant, bool reuse_prefix) {
     options.validate();
     require(!prompt.empty() && prompt.size() <= UINT32_MAX && !tenant.empty(), "empty/oversized prompt or namespace");
     for (auto token : prompt) require(token >= 0 && uint32_t(token) < spec_.vocabulary, "prompt token outside vocabulary");
@@ -126,7 +130,7 @@ std::shared_ptr<Generation> Engine::create(std::vector<int32_t> prompt, Options 
     }
     // Prefix pages carry no drafter state. Drafter-enabled requests therefore
     // prefill from scratch so their drafter cache is derived from real target features.
-    if (config_.use_prefix_cache && !g->mtp_kv && !g->dflash_kv) {
+    if (reuse_prefix && config_.use_prefix_cache && !g->mtp_kv && !g->dflash_kv) {
         auto hit = prefixes_->lookup(g->prompt, tenant);
         if (hit.tokens) {
             g->kv->attach_prefix(hit.blocks, hit.tokens); g->prefilled = hit.tokens; g->reused = hit.tokens;
@@ -136,6 +140,34 @@ std::shared_ptr<Generation> Engine::create(std::vector<int32_t> prompt, Options 
     }
     if (predictor_) { predictor_->request_boundary(); }
     return g;
+}
+std::vector<double> Engine::score(const std::vector<int32_t>& tokens, uint32_t chunk) {
+    require(tokens.size() >= 2 && tokens.size() <= spec_.context, "scoring needs between 2 and context-length tokens");
+    require(chunk >= 1, "scoring chunk must be at least one token");
+    Options options;
+    options.max_new_tokens = 1;
+    options.speculate = false;
+    auto g = create_session(tokens, options, "score", false);
+    const uint32_t V = spec_.vocabulary;
+    std::vector<double> nll;
+    nll.reserve(tokens.size() - 1);
+    const uint32_t step = std::min<uint32_t>(chunk, model_->max_batch());
+    const std::function<bool()> never = [] { return false; };
+    for (uint32_t start = 0; start < tokens.size();) {
+        const uint32_t count = std::min<uint32_t>(step, uint32_t(tokens.size()) - start);
+        std::vector<int32_t> part(tokens.begin() + start, tokens.begin() + start + count);
+        auto result = model_->forward(*g->kv, *cache_, *attention_, part, true, never);
+        for (uint32_t j = 0; j < count && start + j + 1 < tokens.size(); ++j) {
+            const float* row = result.logits.data() + uint64_t(j) * V;
+            double maximum = row[0];
+            for (uint32_t v = 1; v < V; ++v) maximum = std::max<double>(maximum, row[v]);
+            double sum = 0;
+            for (uint32_t v = 0; v < V; ++v) sum += std::exp(double(row[v]) - maximum);
+            nll.push_back(maximum + std::log(sum) - double(row[tokens[start + j + 1]]));
+        }
+        start += count;
+    }
+    return nll;
 }
 void Engine::index_result(Generation& g, uint32_t start, const model::Result& result) {
     if (!config_.use_prefix_cache || g.mtp_kv || g.dflash_kv) { return; }
@@ -176,7 +208,7 @@ void Engine::sync_mtp(Generation& g, const std::function<bool()>& cancelled) {
 void Engine::emit(Generation& g, int32_t token) {
     g.output.push_back(token); g.history.push_back(token);
     if (!g.first_token_ns) { g.first_token_ns = platform::now_ns(); }
-    if (tokenizer_->eog(token)) { g.done = true; g.finish_reason = "stop"; return; }
+    if (!g.options.ignore_eos && tokenizer_->eog(token)) { g.done = true; g.finish_reason = "stop"; return; }
     g.text += tokenizer_->piece(token);
     for (const auto& stop : g.options.stop) {
         auto pos = g.text.find(stop);
