@@ -480,3 +480,134 @@ RESULT: PASS
   for gfx1031 should be verified when a gfx1031 device is available.
 - Integration tests that require HIP (device integration test) are not built
   because `KNJ_ENABLE_DEVICE=OFF` in the host-only build.
+---
+
+## Session 2026-10-08 — Phase 1: GGUF model/index substrate (host, CPU-only)
+
+Roadmap reference: `docs/08-roadmap.md` Phase 1 (C4 loader, metadata side) and
+`Readme.md` §37 Phase 1 (GGUF reader, model fingerprint, tensor directory,
+expert directory, cold extent index, metadata/config extraction).
+
+Scope note: this checkout contained the specification only (`Readme.md`,
+`docs/`, `ai-coder/`) and no code. Earlier entries that mention `src/device`,
+`tests/unit/test_c2_device.cpp` and a Phase 1 CMake tree are not present in this
+repository and were not reconstructed. This entry starts the code tree from the
+specification. Hardware phases (Phase 0 measurements on gfx1201/gfx1031, device
+code, ReBAR, NVMe benchmark) need the target machine and are not started here.
+
+### Phase 1 — GGUF reader, model index, expert directory  ·  DONE (host tier)
+
+**Believed at the time**
+
+- constraint: `Readme.md` §5 — startup cost must be proportional to metadata and
+  trunk/index work, never to expert payload.
+- constraint: `ai-coder/c4-loader.md` — honour `general.alignment` (32/64/128);
+  never read expert weights at load; the cold index must be checksummed against
+  the source.
+- constraint: `Readme.md` §39 — never invent model metadata, never hard-code
+  model dimensions, never silently skip an expert.
+- constraint: `docs/07-build-platforms.md` §2 — the host substrate has no GPU or
+  HIP dependency.
+
+**Decision**
+
+- chose: a C++17 host library (`src/gguf`, `src/util`) with a bounds-checked
+  header reader, a model index built only from metadata and the tensor
+  directory, and a test-only GGUF writer. Verified against the reference writer
+  (`gguf-py`).
+- because: Phase 1 is the first buildable phase without a GPU, and every number
+  it produces can be checked against bytes at known offsets.
+- rejected: hashing the whole file for the fingerprint. That reads the full
+  payload at load and breaks the startup invariant. Payload integrity is left to
+  per-object checksums in C6 (later phase).
+- rejected: defaulting missing geometry (`head_count_kv`, `block_count`, ...).
+  The loader refuses instead. The only derived value is `head_dim = embd /
+  head_count` when `attention.key_length` is absent, which is the llama.cpp
+  convention and is recorded in the geometry struct.
+- rejected: skipping unknown `*_exps.weight` tensors. They raise `ParseError`.
+- falsified by: a reader/writer offset mismatch, or any expert byte differing
+  from the writer's array.
+
+**Changed**
+
+- `CMakeLists.txt` — `knj_substrate` static library, `kanjoos-inspect`,
+  `test_substrate` and a CTest entry.
+- `src/util/sha256.{h,cpp}` — FIPS 180-4 SHA-256 (no external dependency).
+- `src/gguf/gguf_reader.{h,cpp}` — GGUF v2/v3 header, all KV value types, tensor
+  directory, ggml type table (F32/F16/BF16/F64, I8–I64, Q4_0–Q8_K), alignment
+  from `general.alignment`, bounds checks before every allocation. Hashes the
+  bytes it consumes, so the fingerprint costs no extra I/O.
+- `src/gguf/model_index.{h,cpp}` — geometry (`{arch}.*` keys), trunk vs. expert
+  classification, per-layer `ExpertTensor` (gate/up/down, stacked along the
+  expert axis), `expert_span`, `coalesced_extent` (one contiguous read per layer
+  and kind), KV bytes/token from geometry.
+- `src/tools/kanjoos_inspect.cpp` — `kanjoos-inspect model.gguf [--experts]`;
+  exit 0 ok, 2 usage, 3 format/metadata error, 1 other.
+- `tests/unit/test_substrate.cpp`, `tests/unit/gguf_test_writer.h` — 13 test
+  groups, 210 checks.
+- `tests/tools/crosscheck_gguf.py` — writes an MoE GGUF with `gguf-py`, then
+  checks every expert of every layer and kind, read from the offset the inspector
+  reports, against the written array.
+- `.gitignore` — `build/`.
+
+**Verified**
+
+```
+$ cmake -S . -B build -G Ninja && cmake --build build     # 0 warnings, g++ 12.2
+$ ./build/test_substrate
+PASS sha256 vectors and chunking
+PASS gguf header round trip
+PASS alignment 32
+PASS alignment 64
+PASS alignment 128
+PASS malformed inputs refused
+PASS moe expert directory exact
+PASS moe Q8_0 with alignment 64/128
+PASS moe inconsistent metadata refused
+PASS dense model and geometry
+PASS fingerprint stability
+PASS huge model metadata-only load
+PASS ggml type table
+checks: 210  failed checks: 0  failed tests: 0
+
+$ python tests/tools/crosscheck_gguf.py build/kanjoos-inspect 32   # and 64, 128
+alignment 32: 72/72 experts byte-identical to writer
+alignment 64: 72/72 experts byte-identical to writer
+alignment 128: 72/72 experts byte-identical to writer
+```
+
+Sanitizer run (UBSan + ASan, `-fno-sanitize-recover`): clean after the fixes
+below.
+
+**Measurements**
+
+| quantity | value | provenance |
+|---|---|---|
+| sparse 48-layer / 128-expert Q4_K MoE (≈16 GiB expert payload, header-only file) | load succeeds; bytes read at load = header bytes only (< 1 MiB, asserted) | MEASURED (unit test) |
+| whole test suite wall time | 0.01 s | MEASURED |
+| bytes/token, 3 layers × 2 kv heads × head_dim 8 × fp16 | 192 B | MEASURED (matches formula in `09` §9.1) |
+| cold-start on a 4 GB/s disk for a 40 GiB model | **not measured** | GATED (C4 acceptance; needs real NVMe) |
+
+**Bugs found and fixed during this session**
+
+1. `ggml_type_info` lookup divided by zero in the *test writer* for unknown
+   types. Writer now returns 0 bytes; the reader still refuses the type.
+2. Expert-tensor suffix check compared the wrong length (`_exps.weight` is 12
+   bytes). Found by the test suite: no MoE was detected at all.
+3. Cross-check generator wrote `general.alignment` as a raw key, which left the
+   writer's data padding at 32. The reference reader and this reader both
+   refused the file. Fixed by `add_custom_alignment`. The reader's refusal was
+   correct.
+
+**Still open**
+
+- Phase 0 hardware audit (GPU detection, ReBAR, queue topology, NVMe and host-copy
+  benchmarks) is not started. It needs the gfx1201/gfx1031 machine.
+- Expert-object packing, manifest and checksums are Phase 2 (C5/C6). The directory
+  here points at GGUF payloads (Path A in `Readme.md` §8), not at packed objects.
+- The C4 load-time acceptance number is not measured (needs a 40 GiB file on a
+  4 GB/s disk).
+- `tensor offset % general.alignment == 0` is enforced. The GGUF writers checked
+  here always produce this. Revisit if a real file violates it.
+- Fingerprint covers header/directory only. A tensor-data-only change does not
+  change it. Per-object checksums in C6 must cover payloads.
