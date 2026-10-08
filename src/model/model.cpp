@@ -15,7 +15,10 @@ float meta_float(const gguf::ModelIndex& index, const std::string& name, float d
 std::string meta_string(const gguf::ModelIndex& index, const std::string& name, const std::string& def) { auto v = index.find_kv_meta(name); if (!v) return def; require(v->type == gguf::ValueType::STRING, "invalid GGUF string " + name); return v->s; }
 Spec Spec::parse(const gguf::ModelIndex& index) {
     Spec s; auto& g = index.geometry; s.architecture = g.architecture;
-    static const std::set<std::string> supported{"llama", "mistral", "qwen2", "qwen2moe", "qwen3", "qwen3moe", "deepseek", "deepseek2", "glm4moe", "dflash"};
+    // Only schemas with an implemented forward path. qwen3moe is validated against
+    // the independent reference; the others run the same code paths but are not yet
+    // validated against reference outputs (see docs/10-implementation-status.md).
+    static const std::set<std::string> supported{"llama", "qwen2", "qwen3", "qwen2moe", "qwen3moe", "deepseek2"};
     if (!supported.count(s.architecture)) throw Error(ErrorCode::Unsupported, "no validated tensor schema for architecture " + s.architecture + "; a metadata match is required, never a guessed forward pass");
     std::string p = s.architecture + "."; s.total_layers = g.n_layer; s.mtp_layers = meta_u32(index, p + "nextn_predict_layers", 0); require(s.mtp_layers < s.total_layers, "MTP layers exceed total blocks"); s.layers = s.total_layers - s.mtp_layers;
     s.hidden = g.n_embd; s.heads = g.n_head; s.kv_heads = g.n_head_kv; s.key_dim = g.head_dim; s.value_dim = meta_u32(index, p + "attention.value_length", s.key_dim); s.context = meta_u32(index, p + "context_length", 0, true);

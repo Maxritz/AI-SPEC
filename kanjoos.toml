@@ -26,6 +26,7 @@ adaptive_prefetch = false
 [nvme]
 quota_mib = 0
 store_dir = ""
+rebuild_stale_store = false
 [tuning]
 directory = "kanjoos-tune"
 [profile]

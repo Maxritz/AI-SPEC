@@ -1,0 +1,62 @@
+# 10 — Implementation status
+
+This page records what the tree implements, how each part was verified, and
+what is still missing. It is the reference for claims about the code; the
+requirements live in `Readme.md` and `docs/01`–`09`.
+
+Verification levels used below:
+
+- **Verified (host)**: exercised by a test in `ctest` on the CPU reference backend,
+  built with GCC 12 and `-Werror`.
+- **Verified (manual)**: run from the shipped binaries in this environment.
+- **Implemented, unverified**: code exists and compiles, but no test or run has
+  exercised it. Hardware or real-model behaviour is unknown.
+- **Not implemented**: no code for this item in the tree.
+
+No real GGUF model, GPU, ROCm toolchain or Windows machine was available while
+this tree was written. Every model-level test therefore uses a deterministic
+synthetic Qwen3-MoE model and an independent double-precision reference written
+from the model definition.
+
+## Status matrix
+
+| area | status | verification |
+|---|---|---|
+| GGUF reader and model index (Phase 1) | implemented | Verified (host): `substrate` |
+| Expert store v2: packing, manifest, journal, checksum repair, scrub, stale/foreign refusal | implemented | Verified (host): `store`; process-kill crash points run on POSIX only |
+| Lazy store: index-only open, streamed header parse, on-demand packing | implemented | Verified (host): `store`, `model` (eviction run) |
+| Quantisation compiler W2/3/4/6/8, g64/g128, calibration and quality gate | implemented | Verified (host): `compiler`. Quality on real models: not measured |
+| Pools, slots, transfer engine with priorities, residency manager, predictor, budgets, tuning cache | implemented | Verified (host): `runtime`, `model`. GPU timing and transfers: unverified |
+| KV engine: paging, copy-on-write, radix prefix reuse, cold KVP1 persistence, checkpoints | implemented | Verified (host): `kv`, `model` (prefix reuse, suspend/resume) |
+| Tokenizer and chat templates (pinned llama.cpp vocabulary-only loader plus `common/jinja`) | implemented | Verified (host) on a synthetic SPM vocabulary. Real vocabularies: not tested |
+| Qwen3-MoE forward (per-head Q/K norms, NEOX RoPE, GQA, softmax top-k routing, SwiGLU experts, LM head) | implemented | Verified (host): logits within 2e-4 of the independent reference; greedy output identical |
+| MTP (nextn) speculation with same-seed coupled verification | implemented | Verified (host): identical tokens to plain decoding for greedy and seeded sampling; acceptance on real models not measured |
+| Dense llama/qwen2/qwen3, qwen2moe, DeepSeek2 (MLA with unequal K/V widths) forward paths | implemented | Implemented, unverified |
+| Sliding-window attention layers | implemented | Implemented, unverified |
+| Speculation with DFlash / DSpark drafters | not implemented | `spec.drafter` values other than `""`/`"mtp"` are refused with an explicit error |
+| Recurrent, hybrid and DSV4 architectures | not implemented | refused by the architecture allow-list |
+| Grouped expert kernels and WMMA paths (gfx1201), SIMT paths (gfx1031) | implemented in `kernels/` and `src/device/hip_backend.hip` | Implemented, unverified (not compiled) |
+| HIP backend build (`KNJ_ENABLE_HIP=ON`) | implemented | Not compiled in this environment |
+| Measured CPU fallback for expert work (queue, SwiGLU rows, cancellation, cost bookkeeping) | implemented; scheduled only on GPU builds | Verified (host): direct unit checks in `model` against a double-precision reference. Routing decisions on a GPU: unverified |
+| Startup capability, oracle and tuning gates on a GPU | partial: a dense matmul variant is calibrated on GPU builds; no broader oracle | Implemented, unverified |
+| Linux io_uring and Windows IOCP lower-layer I/O | not implemented | workers use portable synchronous file I/O |
+| HTTP server: generation, SSE streaming, sessions, suspend/resume, cancellation, bearer auth, limits, metrics | implemented | Verified (host): `server` (28 checks); Verified (manual) with `curl` on `kanjoos serve` |
+| `kanjoos generate`, `serve`, `doctor` | implemented | Verified (manual) |
+| Windows build | not run | `BUILD.md` lists the known Windows code paths |
+| Real model files, quality numbers, performance numbers | not measured | no model files or GPU were available |
+| AddressSanitizer and UndefinedBehaviorSanitizer (`KNJ_SANITIZE=ON`, Debug) | all 8 suites pass with no sanitizer reports | Verified (host) |
+
+## Known limitations that affect correctness claims
+
+- The synthetic model exercises the Qwen3-MoE schema only. Other architectures
+  share code paths but have no reference comparison.
+- Speculation is verified for the MTP drafter. Its benefit depends on acceptance,
+  which has not been measured on real models.
+- Session checkpoints are resumed with plain decoding. MTP-enabled requests do not
+  use prefix reuse, because the drafter needs hidden states that prefix pages do
+  not carry.
+- The HTTP server serialises engine calls with one lock. Concurrent streams
+  interleave step by step; they do not run in parallel.
+- Queue limits apply at request admission. A streaming response keeps its
+  connection after admission, so long streams are bounded by `server.max_sessions`
+  and the session TTL rather than by the queue counter.

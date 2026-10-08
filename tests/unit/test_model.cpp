@@ -5,7 +5,9 @@
 #include "test_support.h"
 #include "reference_model.h"
 #include "synthetic_model.h"
+#include "compute/executor.h"
 #include "core/config.h"
+#include "core/error.h"
 #include "inference/engine.h"
 #include "inference/sampler.h"
 #include "spec/controller.h"
@@ -188,6 +190,51 @@ void sampler_and_spec_contracts() {
     Config ok; ok.drafter = "mtp"; ok.validate();
 }
 
+// The measured CPU fallback runs on GPU builds only, so it is checked directly:
+// packed host matrices, several routed rows, the SwiGLU result against a plain
+// double-precision evaluation, and cancellation before any row is computed.
+void cpu_fallback_matches_reference() {
+    const uint32_t hidden = 16, ff = 12, rows = 3;
+    auto backend = device::Backend::create("cpu");
+    const uint64_t gate_bytes = uint64_t(ff) * hidden * 4, down_bytes = uint64_t(hidden) * ff * 4;
+    auto weights = backend->allocate(2 * gate_bytes + down_bytes, device::MemoryKind::Pageable);
+    auto input = backend->allocate(rows * hidden * 4, device::MemoryKind::Pageable);
+    std::vector<float> g(ff * hidden), u(ff * hidden), d(hidden * ff), x(rows * hidden);
+    for (size_t i = 0; i < g.size(); ++i) { g[i] = std::sin(0.37f * float(i)) * .2f; u[i] = std::cos(0.11f * float(i)) * .2f; }
+    for (size_t i = 0; i < d.size(); ++i) d[i] = std::sin(0.23f * float(i) + 1) * .2f;
+    for (size_t i = 0; i < x.size(); ++i) x[i] = std::cos(0.5f * float(i)) * .8f;
+    std::memcpy(weights.data, g.data(), gate_bytes);
+    std::memcpy(static_cast<uint8_t*>(weights.data) + gate_bytes, u.data(), gate_bytes);
+    std::memcpy(static_cast<uint8_t*>(weights.data) + 2 * gate_bytes, d.data(), down_bytes);
+    std::memcpy(input.data, x.data(), x.size() * 4);
+    residency::ExpertView view;
+    view.buffer = weights;
+    view.gate = {weights.as<uint8_t>(), ff, hidden, 0};
+    view.up = {weights.as<uint8_t>() + gate_bytes, ff, hidden, 0};
+    view.down = {weights.as<uint8_t>() + 2 * gate_bytes, hidden, ff, 0};
+    compute::CpuFallback fallback(1e9);
+    CHECK(fallback.enabled());
+    const std::vector<uint32_t> routed = {2, 0, 2};
+    auto result = fallback.execute(view, input, routed, hidden, ff, compute::Activation::Silu).get();
+    CHECK(result.values.size() == routed.size() * hidden);
+    for (size_t r = 0; r < routed.size(); ++r) {
+        std::vector<double> gate(ff, 0), up(ff, 0), act(ff, 0);
+        for (uint32_t f = 0; f < ff; ++f) for (uint32_t i = 0; i < hidden; ++i) { gate[f] += double(g[f * hidden + i]) * x[routed[r] * hidden + i]; up[f] += double(u[f * hidden + i]) * x[routed[r] * hidden + i]; }
+        for (uint32_t f = 0; f < ff; ++f) act[f] = gate[f] / (1 + std::exp(-gate[f])) * up[f];
+        for (uint32_t o = 0; o < hidden; ++o) {
+            double y = 0; for (uint32_t f = 0; f < ff; ++f) y += double(d[o * ff + f]) * act[f];
+            CHECK(test::close(float(y), result.values[r * hidden + o], 1e-4f));
+        }
+    }
+    CHECK(fallback.known(gguf::ExpertId{0, 2}) == false);
+    fallback.observe(gguf::ExpertId{0, 2}, 2, 150.0);
+    CHECK(fallback.known(gguf::ExpertId{0, 2}));
+    bool cancelled = false;
+    auto future = fallback.execute(view, input, routed, hidden, ff, compute::Activation::Silu, nullptr, [] { return true; });
+    try { future.get(); } catch (const knj::Error& e) { cancelled = e.code() == knj::ErrorCode::Cancelled; }
+    CHECK(cancelled);
+}
+
 }  // namespace
 
 int main() {
@@ -202,6 +249,7 @@ int main() {
         synth::write(with_mtp, dir + "/mtp.gguf", "knj-synthetic-mtp");
         tokenizer_contract(dir + "/plain.gguf");
         sampler_and_spec_contracts();
+        cpu_fallback_matches_reference();
         forward_matches_reference(plain, dir + "/plain.gguf", dir);
         expert_eviction_and_kv_demotion(plain, dir + "/plain.gguf", dir);
         prefix_reuse_is_exact(plain, dir + "/plain.gguf", dir);
