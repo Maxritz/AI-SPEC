@@ -10,21 +10,27 @@
 #include <cstring>
 #include <set>
 namespace knj::model {
+namespace {
+// Name of the FFN input norm. GLM-4.5 (glm4moe) stores it as post_attention_norm, which llama.cpp's
+// glm4-moe.cpp loads as attn_post_norm and applies before the FFN; every other supported family uses ffn_norm.
+std::string ffn_norm_suffix(const std::string& architecture) { return architecture == "glm4moe" ? "post_attention_norm.weight" : "ffn_norm.weight"; }
+}  // namespace
 uint32_t meta_u32(const gguf::ModelIndex& index, const std::string& name, uint32_t def, bool required) { auto v = index.find_kv_meta(name); if (!v) { require(!required, "missing GGUF metadata " + name); return def; } uint64_t n; require(v->as_uint(&n) && n <= UINT32_MAX, "invalid GGUF integer " + name); return uint32_t(n); }
 float meta_float(const gguf::ModelIndex& index, const std::string& name, float def) { auto v = index.find_kv_meta(name); if (!v) return def; double f; uint64_t n; if (v->type == gguf::ValueType::FLOAT32 || v->type == gguf::ValueType::FLOAT64) f = v->f; else { require(v->as_uint(&n), "invalid GGUF float " + name); f = double(n); } require(std::isfinite(f) && std::abs(f) <= float(FLT_MAX), "nonfinite GGUF scalar " + name); return float(f); }
 std::string meta_string(const gguf::ModelIndex& index, const std::string& name, const std::string& def) { auto v = index.find_kv_meta(name); if (!v) return def; require(v->type == gguf::ValueType::STRING, "invalid GGUF string " + name); return v->s; }
 Spec Spec::parse(const gguf::ModelIndex& index) {
     Spec s; auto& g = index.geometry; s.architecture = g.architecture;
-    // Only schemas with an implemented forward path. qwen3moe is validated against
-    // the independent reference; the others run the same code paths but are not yet
-    // validated against reference outputs (see docs/10-implementation-status.md).
-    static const std::set<std::string> supported{"llama", "qwen2", "qwen3", "qwen2moe", "qwen3moe", "deepseek2"};
+    // Schemas with an implemented forward path. qwen2, qwen3, qwen2moe, qwen3moe, olmoe,
+    // glm4moe and minimax-m2 are validated against the independent double-precision
+    // reference on synthetic fixtures (tests/unit/test_model.cpp). The others run the same
+    // code paths but are not yet validated against reference outputs (docs/10-implementation-status.md).
+    static const std::set<std::string> supported{"llama", "qwen2", "qwen3", "qwen2moe", "qwen3moe", "olmoe", "glm4moe", "minimax-m2", "deepseek2"};
     if (!supported.count(s.architecture)) throw Error(ErrorCode::Unsupported, "no validated tensor schema for architecture " + s.architecture + "; a metadata match is required, never a guessed forward pass");
     std::string p = s.architecture + "."; s.total_layers = g.n_layer; s.mtp_layers = meta_u32(index, p + "nextn_predict_layers", 0); require(s.mtp_layers < s.total_layers, "MTP layers exceed total blocks"); s.layers = s.total_layers - s.mtp_layers;
     s.hidden = g.n_embd; s.heads = g.n_head; s.kv_heads = g.n_head_kv; s.key_dim = g.head_dim; s.value_dim = meta_u32(index, p + "attention.value_length", s.key_dim); s.context = meta_u32(index, p + "context_length", 0, true);
     auto* embed = index.find_tensor_info("token_embd.weight"); auto* output = index.find_tensor_info("output.weight"); require(embed || (s.architecture == "dflash" && output), "missing token embedding/head"); s.vocabulary = uint32_t((embed ? embed : output)->dims.at(1));
     s.epsilon = meta_float(index, p + "attention.layer_norm_rms_epsilon", 1e-5f); s.rope_base = meta_float(index, p + "rope.freq_base", 10000);
-    s.rope_dim = meta_u32(index, p + "rope.dimension_count", s.key_dim); s.neox = s.architecture.rfind("qwen", 0) == 0 || s.architecture == "dflash";
+    s.rope_dim = meta_u32(index, p + "rope.dimension_count", s.key_dim); s.neox = s.architecture.rfind("qwen", 0) == 0 || s.architecture == "dflash" || s.architecture == "olmoe" || s.architecture == "glm4moe" || s.architecture == "minimax-m2";
     s.q_rank = meta_u32(index, p + "attention.q_lora_rank"); s.kv_rank = meta_u32(index, p + "attention.kv_lora_rank"); s.mla = s.kv_rank > 0;
     if (s.mla) {
         s.kv_heads = s.heads; const auto* q = index.find_tensor_info(s.q_rank ? "blk.0.attn_q_b.weight" : "blk.0.attn_q.weight"); require(q && q->dims.at(1) % s.heads == 0, "MLA Q projection shape mismatch");
@@ -43,7 +49,9 @@ Spec Spec::parse(const gguf::ModelIndex& index) {
     }
     s.attn_scale = 1 / std::sqrt(float(s.key_dim));
     if (s.mla && scaling == "yarn") { float logmul = meta_float(index, p + "rope.scaling.yarn_log_multiplier", .1f); float magnitude = 1 + logmul * std::log(factor); s.attn_scale *= magnitude * magnitude; s.rope_attn /= 1 + .1f * std::log(factor); }
-    s.gating = meta_u32(index, p + "expert_gating_func", s.architecture == "glm4moe" ? 2 : 1); s.normalize_topk = meta_u32(index, p + "expert_weights_norm", s.architecture == "qwen3moe" ? 1 : 0) != 0;
+    // Sigmoid routing with an expert-selection bias for glm4moe and minimax-m2; their top-k weights are renormalised.
+    const bool sigmoid_router = s.architecture == "glm4moe" || s.architecture == "minimax-m2";
+    s.gating = meta_u32(index, p + "expert_gating_func", sigmoid_router ? 2 : 1); s.normalize_topk = meta_u32(index, p + "expert_weights_norm", (s.architecture == "qwen3moe" || sigmoid_router) ? 1 : 0) != 0;
     s.expert_scale = meta_float(index, p + "expert_weights_scale", 1); s.groups = meta_u32(index, p + "expert_group_count", 1); s.groups_used = meta_u32(index, p + "expert_group_used_count", s.groups);
     auto act = meta_string(index, p + "hidden_activation", "silu"); if (act == "gelu" || act == "gelu_pytorch_tanh") s.activation = compute::Activation::Gelu; else require(act == "silu" || act == "relu", "unsupported declared activation"); if (act == "relu") s.activation = compute::Activation::Relu;
     uint32_t window = meta_u32(index, p + "attention.sliding_window", 0); s.windows.assign(s.total_layers, window);
@@ -88,7 +96,7 @@ Model::Model(const gguf::ModelIndex& i, Spec s, Runtime& r, transfer::Engine& t,
     }
     (void)tensor("token_embd.weight"); (void)tensor("output_norm.weight");
     for (uint32_t layer = 0; layer < spec_.total_layers; ++layer) {
-        auto prefix = "blk." + std::to_string(layer) + "."; (void)tensor(prefix + "attn_norm.weight"); (void)tensor(prefix + "ffn_norm.weight"); (void)tensor(prefix + "attn_output.weight");
+        auto prefix = "blk." + std::to_string(layer) + "."; (void)tensor(prefix + "attn_norm.weight"); (void)tensor(prefix + ffn_norm_suffix(spec_.architecture)); (void)tensor(prefix + "attn_output.weight");
         const auto& q = tensor(prefix + (spec_.q_rank ? "attn_q_b.weight" : "attn_q.weight")); require(q.matrix.rows == spec_.heads * spec_.key_dim, "Q projection shape disagrees with metadata");
         const auto& out = tensor(prefix + "attn_output.weight"); require(out.matrix.rows == spec_.hidden && out.matrix.cols == spec_.heads * spec_.value_dim, "attention output projection shape mismatch");
         if (!spec_.mla) { require(tensor(prefix + "attn_k.weight").matrix.rows == spec_.kv_heads * spec_.key_dim && tensor(prefix + "attn_v.weight").matrix.rows == spec_.kv_heads * spec_.value_dim, "K/V projection shape mismatch"); }
@@ -114,6 +122,14 @@ Result Model::run(kv::Session& session, kv::Cache& cache, attn::Attention& attn,
     auto submit = [&](profile::OpClass cls, auto plan, auto function, std::vector<Ticket> deps, uint32_t layer, const std::string& name, device::StreamId stream) { return runtime_.submit({cls, stream, [plan, function](device::Backend& b, auto s) { (b.*function)(plan, s); }, std::move(deps), keep, layer, name}); };
     auto mat = [&](const std::string& name, device::Buffer in, device::Buffer out, uint32_t count, Ticket dep, profile::OpClass cls, uint32_t layer) { const auto& w = tensor(name); MatmulPlan p{w.matrix, in.as<float>(), out.as<float>(), nullptr, count, variant_}; std::string bias = name.substr(0, name.size() - 6) + "bias"; if (has(bias)) p.bias = tensor(bias).buffer.as<float>(); return submit(cls, p, &device::Backend::matmul, {dep}, layer, "dense-matmul-v1", runtime_.compute_stream()); };
     auto norm = [&](device::Buffer in, device::Buffer out, const std::string& name, uint32_t rows, uint32_t cols, Ticket dep, uint32_t layer) { NormPlan p{in.as<float>(), out.as<float>(), tensor(name).buffer.as<float>(), nullptr, rows, cols, spec_.epsilon}; return submit(profile::OpClass::Norm, p, &device::Backend::norm, {dep}, layer, "rmsnorm-v1", runtime_.compute_stream()); };
+    // QK RMS norm. Full-width weights (OLMoE, MiniMax-M2) normalise each token's whole Q or K vector;
+    // per-head weights (Qwen3) normalise each head separately.
+    auto qk_norm = [&](device::Buffer data, uint32_t width, const std::string& name, Ticket dep, uint32_t layer) {
+        const uint64_t dim = tensor(name).dims.at(0);
+        if (dim == width) return norm(data, data, name, n, width, dep, layer);
+        require(dim == spec_.key_dim && width % spec_.key_dim == 0, "QK norm width mismatch " + name);
+        return norm(data, data, name, n * (width / spec_.key_dim), spec_.key_dim, dep, layer);
+    };
     auto rearrange = [&](RearrangePlan p, Ticket dep, uint32_t layer) { return submit(profile::OpClass::Projection, p, &device::Backend::rearrange, {dep}, layer, "strided-rearrange-v1", runtime_.compute_stream()); };
     auto add = [&](device::Buffer in, device::Buffer delta, device::Buffer out, Ticket dep, uint32_t layer) { return submit(profile::OpClass::Residual, AddPlan{in.as<float>(), delta.as<float>(), out.as<float>(), uint64_t(n) * h}, &device::Backend::add, {dep}, layer, "residual-v1", runtime_.compute_stream()); };
     Ticket last = submit(profile::OpClass::Embed, EmbedPlan{tensor("token_embd.weight").matrix, token_device.as<int32_t>(), x.as<float>(), n}, &device::Backend::embed, {uploaded}, 0, "embedding-v1", runtime_.compute_stream());
@@ -143,8 +159,8 @@ Result Model::run(kv::Session& session, kv::Cache& cache, attn::Attention& attn,
         last = norm(x, normed, prefix + "attn_norm.weight", n, h, last, layer); Ticket qdone, kdone;
         if (!spec_.mla) {
             qdone = mat(prefix + "attn_q.weight", normed, q, n, last, profile::OpClass::Projection, layer); kdone = mat(prefix + "attn_k.weight", normed, k, n, last, profile::OpClass::Projection, layer); last = mat(prefix + "attn_v.weight", normed, v, n, last, profile::OpClass::Projection, layer);
-            if (has(prefix + "attn_q_norm.weight")) qdone = norm(q, q, prefix + "attn_q_norm.weight", n * spec_.heads, spec_.key_dim, qdone, layer);
-            if (has(prefix + "attn_k_norm.weight")) kdone = norm(k, k, prefix + "attn_k_norm.weight", n * spec_.kv_heads, spec_.key_dim, kdone, layer);
+            if (has(prefix + "attn_q_norm.weight")) qdone = qk_norm(q, qwidth, prefix + "attn_q_norm.weight", qdone, layer);
+            if (has(prefix + "attn_k_norm.weight")) kdone = qk_norm(k, kwidth, prefix + "attn_k_norm.weight", kdone, layer);
         } else {
             if (spec_.q_rank) { qdone = mat(prefix + "attn_q_a.weight", normed, extra2, n, last, profile::OpClass::Projection, layer); qdone = norm(extra2, extra2, prefix + "attn_q_a_norm.weight", n, spec_.q_rank, qdone, layer); qdone = mat(prefix + "attn_q_b.weight", extra2, q, n, qdone, profile::OpClass::Projection, layer); }
             else qdone = mat(prefix + "attn_q.weight", normed, q, n, last, profile::OpClass::Projection, layer);
@@ -169,7 +185,7 @@ Result Model::run(kv::Session& session, kv::Cache& cache, attn::Attention& attn,
             auto wrote = submit(profile::OpClass::KVWrite, p, &device::Backend::kv_write, {kdone, last, page->last_write}, layer, "kv-encode-at-write-v1", runtime_.aux_stream()); page->last_write = wrote; writes.push_back(wrote); t += count;
         }
         last = attn.run(session, cache_layer, q, positions, n, spec_.heads, spec_.key_dim, a, std::move(writes), spec_.windows[layer]);
-        last = mat(prefix + "attn_output.weight", a, mix, n, last, profile::OpClass::AttnMix, layer); last = add(x, mix, y, last, layer); last = norm(y, normed, prefix + "ffn_norm.weight", n, h, last, layer);
+        last = mat(prefix + "attn_output.weight", a, mix, n, last, profile::OpClass::AttnMix, layer); last = add(x, mix, y, last, layer); last = norm(y, normed, prefix + ffn_norm_suffix(spec_.architecture), n, h, last, layer);
         bool moe = has(prefix + "ffn_gate_inp.weight");
         auto dense_ffn = [&](const std::string& suffix, device::Buffer out, Ticket dependency) {
             const auto& w = tensor(prefix + "ffn_up" + suffix + ".weight"); uint32_t width = w.matrix.rows; require(width <= ff, "FFN exceeds reserved shape"); auto gdone = mat(prefix + "ffn_gate" + suffix + ".weight", normed, gate, n, dependency, profile::OpClass::Projection, layer); auto udone = mat(prefix + "ffn_up" + suffix + ".weight", normed, up, n, dependency, profile::OpClass::Projection, layer);

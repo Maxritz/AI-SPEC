@@ -1,7 +1,8 @@
-// End-to-end model and inference checks on a synthetic Qwen3-MoE GGUF.
-// Every expected value comes from reference_model.h (double precision, written
-// from the model definition) or from a second engine configuration that must
-// reproduce the first bit-for-bit in token identity.
+// End-to-end model and inference checks on synthetic GGUF fixtures. The qwen3moe
+// fixture carries the detailed checks; every supported family (qwen2, qwen2moe, olmoe,
+// minimax-m2, glm4moe) then runs the same suite on its own fixture. Every expected value
+// comes from reference_model.h (double precision, written from the model definition) or
+// from a second engine configuration that must reproduce the first bit-for-bit in token identity.
 #include "test_support.h"
 #include "reference_model.h"
 #include "synthetic_model.h"
@@ -63,6 +64,12 @@ void forward_matches_reference(const synth::Model& model, const std::string& pat
     auto g = engine.create(prompt, greedy(12));
     while (g->prefilled < prompt.size()) engine.step(*g);
     CHECK(g->logits.size() == model.d.vocab);
+    double worst = 0, magnitude = 0;
+    for (size_t v = 0; v < g->logits.size(); ++v) {
+        worst = std::max(worst, std::abs(expected_rows.back()[v] - double(g->logits[v])));
+        magnitude = std::max(magnitude, std::abs(expected_rows.back()[v]));
+    }
+    if (worst > 2e-4) std::cerr << "forward mismatch arch=" << model.d.arch << " worst=" << worst << " logit_magnitude=" << magnitude << '\n';
     for (size_t v = 0; v < g->logits.size(); ++v) CHECK(test::close(float(expected_rows.back()[v]), g->logits[v], 2e-4f));
     CHECK(run_to_end(engine, *g) == reference.greedy(prompt, 12, 2));
     CHECK(g->finish_reason == "length");
@@ -95,7 +102,8 @@ void expert_eviction_and_kv_demotion(const synth::Model& model, const std::strin
     const std::vector<int32_t> prompt = {6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25};
     Config c = make_config(dir + "/tight");
     c.slot_count = 1;        // one device expert slot: every routed miss evicts
-    c.kv_bytes = 16384;      // four 16-token pages: forces hot-to-warm KV movement
+    // Four 16-token pages of f32 KV across every cached layer (a NextN block adds one): forces hot-to-warm KV movement.
+    c.kv_bytes = 4ull * 16 * model.d.total() * model.d.kv_heads * (model.d.key + model.d.value) * 4;
     inference::Engine engine(path, c);
     auto g = engine.create(prompt, greedy(16));
     CHECK(run_to_end(engine, *g) == reference.greedy(prompt, 16, 2));
@@ -143,13 +151,16 @@ void prefix_reuse_is_exact(const synth::Model& model, const std::string& path, c
 
 void checkpoint_resume_is_exact(const synth::Model& model, const std::string& path, const std::string& dir) {
     refm::Reference reference(model);
+    // The checkpoint must land mid-generation: the reference continuation has to run to full length.
     const std::vector<int32_t> prompt = {5, 9, 12, 16, 20, 24, 28, 4, 8, 11};
+    CHECK(reference.greedy(prompt, 12, 2).size() >= 7);  // five tokens before the checkpoint, at least two after
     const std::string checkpoint = dir + "/session.kvs";
     std::vector<int32_t> first_part;
     {
         inference::Engine engine(path, make_config(dir + "/ckpt"));
         auto g = engine.create(prompt, greedy(12));
-        while (g->output.size() < 5) engine.step(*g);
+        while (g->output.size() < 5 && !g->done) engine.step(*g);
+        CHECK(g->output.size() >= 5);
         first_part = g->output;
         engine.suspend(*g, checkpoint);
     }
@@ -257,6 +268,31 @@ void cpu_fallback_matches_reference() {
     CHECK(cancelled);
 }
 
+// Every supported family runs the same checks on its own synthetic GGUF: prefill logits and greedy
+// decoding against the double-precision reference, teacher-forced scoring, expert eviction and KV
+// demotion where the family has experts, prefix reuse, checkpoint resume, and MTP speculation where
+// the family carries a NextN block.
+void family_suite(const std::string& arch, const std::string& dir, uint32_t seed) {
+    const synth::Dims dims = synth::family(arch);
+    // Random weights can settle on BOS then EOS for some seeds, which would end every generation at once.
+    // Take the first seed, from `seed` upward, whose reference continuation of the probe prompt has at least seven tokens.
+    const std::vector<int32_t> probe = {5, 9, 12, 16, 20, 24, 28, 4, 8, 11};
+    uint32_t chosen = seed;
+    while (refm::Reference(synth::build(dims, chosen)).greedy(probe, 12, 2).size() < 7) {
+        if (++chosen - seed > 64) throw std::runtime_error("no fixture seed gives a full-length continuation for " + arch);
+    }
+    const synth::Model model = synth::build(dims, chosen);
+    const std::string path = dir + "/" + arch + ".gguf";
+    synth::write(model, path);
+    const std::string base = dir + "/" + arch;
+    forward_matches_reference(model, path, base);
+    scoring_matches_reference(model, path, base);
+    if (dims.experts) expert_eviction_and_kv_demotion(model, path, base);
+    prefix_reuse_is_exact(model, path, base);
+    checkpoint_resume_is_exact(model, path, base);
+    if (dims.mtp) speculation_identity(model, path, base);
+}
+
 }  // namespace
 
 int main() {
@@ -279,6 +315,8 @@ int main() {
         checkpoint_resume_is_exact(plain, dir + "/plain.gguf", dir);
         cancellation_and_admission(plain, dir + "/plain.gguf", dir);
         speculation_identity(with_mtp, dir + "/mtp.gguf", dir);
+        uint32_t seed = 77;
+        for (const char* arch : {"qwen3moe", "qwen2", "qwen2moe", "olmoe", "minimax-m2", "glm4moe"}) family_suite(arch, dir, seed++);
         std::cout << "model checks: " << test::checks << " passed\n";
         return 0;
     } catch (const std::exception& e) {

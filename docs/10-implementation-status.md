@@ -31,10 +31,11 @@ from the model definition.
 | Tokenizer and chat templates (pinned llama.cpp vocabulary-only loader plus `common/jinja`) | implemented | Verified (host) on a synthetic SPM vocabulary. Real vocabularies: not tested |
 | Qwen3-MoE forward (per-head Q/K norms, NEOX RoPE, GQA, softmax top-k routing, SwiGLU experts, LM head) | implemented | Verified (host): logits within 2e-4 of the independent reference; greedy output identical |
 | MTP (nextn) speculation with same-seed coupled verification | implemented | Verified (host): identical tokens to plain decoding for greedy and seeded sampling; acceptance on real models not measured |
-| Dense llama/qwen2/qwen3, qwen2moe, DeepSeek2 (MLA with unequal K/V widths) forward paths | implemented | Implemented, unverified |
+| MoE and dense families `qwen2` (dense, Q/K/V biases), `qwen2moe`, `olmoe` (full-width Q/K norm), `minimax-m2` (full-width Q/K norm, partial NEOX RoPE, sigmoid routing with bias), `glm4moe` (Q/K/V biases, partial RoPE, sigmoid group routing, shared expert, dense lead block, NextN) | implemented | Verified (host): `test_model` family suite, 720 checks in total. Logits within 2e-4 of the double-precision reference; greedy, scoring, expert eviction, prefix reuse, checkpoint and (GLM) MTP identity on synthetic random-weight fixtures. Real weights not tested. See `docs/11-model-families.md` |
+| Dense llama and qwen3 forward paths, DeepSeek2 (MLA with unequal K/V widths) | implemented | Implemented, unverified: not in the family suite; no MLA reference |
 | Sliding-window attention layers | implemented | Implemented, unverified |
 | Speculation with DFlash / DFlash2 / DSpark drafters (one loader, arch `dflash`; Markov and confidence heads; selector lattice and dynamic conv; `d2t`; sinks, sliding windows, post norms, value/logit scales) | implemented | Verified (host): `drafter` suite, 5,370 checks. All 8 flavour/option configurations agree with the independent double-precision reference (K/V injection, incremental injection, truncation, drafts, confidences); drafted generation is token-identical to plain decoding for greedy and seeded sampling. Real drafter weights: not measured |
-| Recurrent, hybrid and DSV4 architectures | not implemented | refused by the architecture allow-list (see the section on open items below) |
+| Recurrent and hybrid architectures (`qwen3next`, `qwen35`, `qwen35moe`, `qwen4exp`) and DSV4 (`deepseek4`) | not implemented | refused by the architecture allow-list; status and plan per family in `docs/11-model-families.md` |
 | Grouped expert kernels and WMMA paths (gfx1201), SIMT paths (gfx1031) | implemented in `kernels/` and `src/device/hip_backend.hip` | Implemented, unverified (not compiled) |
 | HIP backend build (`KNJ_ENABLE_HIP=ON`) | implemented | Not compiled in this environment |
 | Measured CPU fallback for expert work (queue, SwiGLU rows, cancellation, cost bookkeeping) | implemented; scheduled only on GPU builds | Verified (host): direct unit checks in `model` against a double-precision reference. Routing decisions on a GPU: unverified |
@@ -84,12 +85,18 @@ from the model definition.
 These are not implemented in this tree. The architecture allow-list refuses them with
 `Unsupported`, so nothing runs with a guessed forward pass.
 
-- **Recurrent (gated-delta-net and similar), hybrid attention/recurrent stacks, and
-  DSV4.** Each needs a new tensor schema, a reference implementation for the synthetic
-  fixture, and runtime support. Recurrent layers also need a separate state array with
-  its own budget (`docs/02-components.md`, C14), and hybrid prefixes need replay-suffix
-  rollback instead of prefix reuse (C12). DSV4 adds hyper-connections, sinkhorn routing
-  and compressed attention. None of this has been started in the tree.
+- **Recurrent (gated-delta-net) and hybrid attention/recurrent stacks, Qwen3.8-Flash-Next
+  (`qwen4exp`), and DSV4 (`deepseek4`).** Each needs a new tensor schema, a reference
+  implementation for the synthetic fixture, and runtime support. Recurrent layers need a
+  separate state array with its own budget (`docs/02-components.md`, C14), and hybrid
+  prefixes need replay-suffix rollback instead of prefix reuse (C12). Qwen3.8-Flash-Next
+  adds Qwen Sparse Attention, a gated residual and hash n-gram embeddings. DSV4 adds
+  hyper-connections, sinkhorn routing, compressed attention and FP4 experts. See
+  `docs/11-model-families.md` for the per-family list.
+- **Other MoE families.** The pinned llama.cpp registers more MoE architectures than the
+  six verified profiles. The ones not yet implemented (`openai-moe`, `llama4`, `mixtral`,
+  `dots1`, `ernie4_5-moe`, `hunyuan-moe`, `granitemoe`, and newer releases) are listed in
+  `docs/11-model-families.md` with what each needs.
 - **DSV4-stage DSpark drafters** (drafters with `hyper_connection.count` > 0). The loader
   refuses them with `Unsupported` and a named message.
 - **Real-model and GPU measurements.** Blocked by the sandbox (no weights, no GPU). The

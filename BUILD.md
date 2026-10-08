@@ -52,8 +52,11 @@ CPU reference backend. `kanjoos doctor` reports the reason.
 | `model` | tokenizer and chat rendering; forward logits against an independent double-precision reference; greedy identity under expert eviction and KV demotion; MTP speculation identical to plain decoding; prefix reuse; suspend/resume; cancellation; admission |
 | `server` | the HTTP API on an ephemeral port: auth, one-shot and streamed generation, chat, sessions with suspend/resume, error mapping |
 
-The `model` and `server` tests build a deterministic synthetic Qwen3-MoE GGUF in
-a temporary directory. No model file is needed.
+The `model` and `server` tests build deterministic synthetic GGUF files in a temporary
+directory. No model file is needed. The `model` test also runs a family suite over six
+architectures (`qwen3moe`, `qwen2`, `qwen2moe`, `olmoe`, `minimax-m2`, `glm4moe`) with
+their own tensor layouts, biases, normalisation and routing. Supported and researched
+architectures, with their status, are listed in `docs/11-model-families.md`.
 
 Sanitizer run:
 
