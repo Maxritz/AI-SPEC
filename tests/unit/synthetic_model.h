@@ -41,7 +41,7 @@ inline std::vector<std::string> vocabulary() {
 }
 
 inline const char* chat_template() {
-    return "{% for m in messages %}{{ m['role'] }}:{{ m['content'] }}\n{% endfor %}{% if add_generation_prompt %}assistant:{% endif %}";
+    return "{% for m in messages %}{{ m['role'] }} {{ m['content'] }} {% endfor %}{% if add_generation_prompt %}assistant {% endif %}";
 }
 
 inline Model build(const Dims& d, uint32_t seed) {

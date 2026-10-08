@@ -45,8 +45,9 @@ void tokenizer_contract(const std::string& path) {
     CHECK(tok.piece(4) == "a");
     CHECK(!tok.identity().empty());
     nlohmann::json messages = nlohmann::json::array({{{"role", "user"}, {"content", "hi"}}});
-    CHECK(tok.chat(messages) == "user:hi\nassistant:");
-    CHECK(tok.chat(messages, false) == "user:hi\n");
+    CHECK(tok.chat(messages) == "user hi assistant ");
+    CHECK(tok.chat(messages, false) == "user hi ");
+    test::throws([&] { tok.encode(std::string("tab\there\n"), false, false); });
     test::throws([&] { tok.chat(nlohmann::json::array()); });
     test::throws([&] { tok.piece(999); });
 }

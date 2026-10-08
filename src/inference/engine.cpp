@@ -36,7 +36,7 @@ Engine::Engine(const std::string& path, Config config, int device) : config_(std
     if (index_.has_experts()) {
         if (std::filesystem::exists(dir + "/manifest")) { packing = store::ExpertStore::read_config(dir); }
         packing.index_only = true;
-        store_ = std::make_unique<store::ExpertStore>(store::ExpertStore::open(dir, index_, packing));
+        store_ = std::make_unique<store::ExpertStore>(store::ExpertStore::open(dir, index_, packing, config_.rebuild_stale_store ? store::OpenMode::RebuildIfStale : store::OpenMode::Strict));
     }
     uint64_t max_expert = largest_expert(index_, packing); uint32_t experts = uint32_t(index_.experts.size()) * index_.geometry.n_expert;
     budget_ = BudgetManager::select(backend_->caps(), platform::memory_info(), config_, model::Spec::resident_bytes(index_), index_.expert_bytes, max_expert, experts, platform::disk_info(dir).capacity);

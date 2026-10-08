@@ -36,7 +36,7 @@ Config Config::load(const std::string& path) {
         BYTES("ram.warm_mib", warm_bytes, 1ull << 20) REAL("ram.warm_fraction", warm_fraction) REAL("ram.min_free_gib", min_free_gib)
         BYTES("transfer.chunk_mib", staging_chunk_bytes, 1ull << 20) UINT("transfer.staging_chunks", staging_chunks) UINT("transfer.io_workers", io_workers)
         REAL("transfer.measured_h2d_gbs", measured_h2d_gbs) BOOL("transfer.adaptive_prefetch", adaptive_prefetch)
-        BYTES("nvme.quota_mib", nvme_quota, 1ull << 20) STR("nvme.store_dir", store_dir)
+        BYTES("nvme.quota_mib", nvme_quota, 1ull << 20) STR("nvme.store_dir", store_dir) BOOL("nvme.rebuild_stale_store", rebuild_stale_store)
         STR("tuning.directory", tune_dir) STR("profile.mode", profiling) STR("profile.directory", profile_dir)
         UINT("profile.floor", profile_floor) UINT("profile.warmup", profile_warmup) BOOL("profile.subtract_floor", subtract_floor) BOOL("profile.force_cold", force_cold)
         STR("server.host", host)

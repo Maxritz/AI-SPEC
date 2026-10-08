@@ -44,15 +44,37 @@ Tokenizer::Tokenizer(const gguf::ModelIndex& index) : impl_(std::make_unique<Imp
 }
 Tokenizer::~Tokenizer() = default;
 std::vector<int32_t> Tokenizer::encode(const std::string& text, bool special, bool parse) const {
-    require(text.size() <= INT32_MAX, "tokenizer input exceeds signed API length"); int32_t count = llama_tokenize(impl_->vocab, text.data(), int32_t(text.size()), nullptr, 0, special, parse);
-    if (!count) { return {}; }
-    require(count != INT32_MIN, "tokenizer size overflow"); uint32_t size = uint32_t(count < 0 ? -count : count); std::vector<int32_t> out(size);
-    count = llama_tokenize(impl_->vocab, text.data(), int32_t(text.size()), out.data(), int32_t(size), special, parse); require(count >= 0 && uint32_t(count) <= size, "tokenizer output size changed"); out.resize(size_t(count)); return out;
+    require(text.size() <= INT32_MAX, "tokenizer input exceeds signed API length");
+    try {
+        int32_t count = llama_tokenize(impl_->vocab, text.data(), int32_t(text.size()), nullptr, 0, special, parse);
+        if (!count) { return {}; }
+        require(count != INT32_MIN, "tokenizer size overflow");
+        uint32_t size = uint32_t(count < 0 ? -count : count);
+        std::vector<int32_t> out(size);
+        count = llama_tokenize(impl_->vocab, text.data(), int32_t(text.size()), out.data(), int32_t(size), special, parse);
+        require(count >= 0 && uint32_t(count) <= size, "tokenizer output size changed");
+        out.resize(size_t(count));
+        return out;
+    } catch (const std::exception& e) {
+        // Upstream reports untokenizable bytes (no byte-fallback piece) by throwing.
+        throw Error(ErrorCode::Unsupported, std::string("tokenizer cannot encode this text with the model vocabulary: ") + e.what());
+    }
 }
 std::string Tokenizer::piece(int32_t token, bool special) const {
-    require(token >= 0 && uint32_t(token) < vocab_size(), "token outside vocabulary"); char buffer[256]; int n = llama_token_to_piece(impl_->vocab, token, buffer, sizeof(buffer), 0, special);
-    if (n >= 0) { return std::string(buffer, size_t(n)); }
-    require(n != INT32_MIN, "token piece too long"); std::string out(size_t(-n), '\0'); int actual = llama_token_to_piece(impl_->vocab, token, out.data(), -n, 0, special); require(actual >= 0 && size_t(actual) <= out.size(), "token piece length changed"); out.resize(size_t(actual)); return out;
+    require(token >= 0 && uint32_t(token) < vocab_size(), "token outside vocabulary");
+    try {
+        char buffer[256];
+        int n = llama_token_to_piece(impl_->vocab, token, buffer, sizeof(buffer), 0, special);
+        if (n >= 0) { return std::string(buffer, size_t(n)); }
+        require(n != INT32_MIN, "token piece too long");
+        std::string out(size_t(-n), '\0');
+        int actual = llama_token_to_piece(impl_->vocab, token, out.data(), -n, 0, special);
+        require(actual >= 0 && size_t(actual) <= out.size(), "token piece length changed");
+        out.resize(size_t(actual));
+        return out;
+    } catch (const std::exception& e) {
+        throw Error(ErrorCode::Unsupported, std::string("token has no printable piece in this vocabulary: ") + e.what());
+    }
 }
 std::string Tokenizer::decode(const std::vector<int32_t>& tokens, bool special) const { std::string out; for (auto t : tokens) out += piece(t, special); return out; }
 std::string Tokenizer::chat(const nlohmann::json& messages, bool generation, const nlohmann::json& options) const {

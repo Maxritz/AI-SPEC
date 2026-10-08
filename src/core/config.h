@@ -13,7 +13,7 @@ struct Config {
     uint64_t vram_ceiling = 0, kv_bytes = 0, warm_bytes = 0, staging_chunk_bytes = 2ull << 20, workspace_bytes = 128ull << 20;
     uint64_t nvme_quota = 0, session_ttl_ns = 600ull * 1000000000, max_tokens = 4096;
     double warm_fraction = .65, min_free_gib = 8, kv_fraction = .5, measured_h2d_gbs = 0, spill_wire_ms = 0;
-    bool wmma = false, allow_quantized_kv = false, subtract_floor = true, force_cold = false, use_prefix_cache = true, adaptive_prefetch = false;
+    bool rebuild_stale_store = false, wmma = false, allow_quantized_kv = false, subtract_floor = true, force_cold = false, use_prefix_cache = true, adaptive_prefetch = false;
     std::string store_dir, tune_dir = "kanjoos-tune", profile_dir, api_key_env = "KANJOOS_API_KEY", drafter;
     static Config load(const std::string& path);
     void validate() const;
