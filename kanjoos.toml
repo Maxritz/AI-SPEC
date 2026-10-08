@@ -1,0 +1,53 @@
+schema_version = 1
+[gpu]
+backend = "auto"
+wmma = false
+vram_ceiling_mib = 0
+kv_mib = 0
+expert_slots = 0
+token_block = 32
+layer_slab = 4
+kv_fraction = 0.50
+workspace_mib = 128
+[kv]
+codec = "f16"
+allow_precision_reduction = false
+prefix_cache = true
+[ram]
+warm_mib = 0
+warm_fraction = 0.65
+min_free_gib = 8
+[transfer]
+chunk_mib = 2
+staging_chunks = 4
+io_workers = 2
+measured_h2d_gbs = 0.0
+adaptive_prefetch = false
+[nvme]
+quota_mib = 0
+store_dir = ""
+[tuning]
+directory = "kanjoos-tune"
+[profile]
+mode = "off"
+directory = ""
+floor = 256
+warmup = 0
+subtract_floor = true
+force_cold = false
+[server]
+host = "127.0.0.1"
+port = 8080
+max_sessions = 16
+max_queued = 128
+max_body_bytes = 1048576
+api_key_env = "KANJOOS_API_KEY"
+session_ttl_seconds = 600
+[inference]
+prefill_chunk = 128
+max_tokens = 4096
+spill_wire_ms = 0.0
+[spec]
+drafter = ""
+draft_width = 4
+max_draft_width = 16

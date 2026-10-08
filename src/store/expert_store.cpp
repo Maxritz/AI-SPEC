@@ -1,8 +1,6 @@
 #include "store/expert_store.h"
 
-#include <fcntl.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include "platform/platform.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -15,6 +13,13 @@
 #include <tuple>
 
 #include "util/sha256.h"
+#include "util/hash.h"
+#include "device/weight_decode.h"
+#include "compute/plans.h"
+#include "tensor/tensor_io.h"
+#include "router/router.h"
+#include "util/checked.h"
+#include <cmath>
 
 namespace fs = std::filesystem;
 
@@ -37,7 +42,7 @@ void maybe_crash(CrashPoint p) {
 
 // ------------------------------------------------------------------ constants
 constexpr uint64_t kPayloadAlign = 4096;
-constexpr uint32_t kObjFormat = 1;
+constexpr uint32_t kObjFormat = 2;
 constexpr char kObjMagic[4] = {'K', 'X', 'O', '1'};
 constexpr size_t kMaxHeaderBytes = 4u << 20;
 constexpr char kManifestMagic[] = "kanjoos-manifest 1";
@@ -120,11 +125,13 @@ private:
 // per-expert hashes make every payload byte checkable.
 struct ExpertRec {
     Digest hash{};
+    Digest source_hash{};
     float quality_loss = 0.0f;
     float route_loss = 0.0f;
 };
 
 struct ObjHeader {
+    uint32_t format_version = kObjFormat;
     uint32_t packing_version = 0;
     std::string identity;
     std::string fingerprint;
@@ -140,7 +147,7 @@ struct ObjHeader {
 
 std::string encode_header(const ObjHeader& h) {
     std::string s(kObjMagic, 4);
-    put_u32(s, kObjFormat);
+    put_u32(s, h.format_version);
     put_u32(s, h.packing_version);
     put_str(s, h.identity);
     put_str(s, h.fingerprint);
@@ -157,6 +164,7 @@ std::string encode_header(const ObjHeader& h) {
     put_u64(s, h.payload_offset);
     for (const ExpertRec& r : h.recs) {
         s.append(reinterpret_cast<const char*>(r.hash.data()), r.hash.size());
+        if (h.format_version >= 2) s.append(reinterpret_cast<const char*>(r.source_hash.data()), r.source_hash.size());
         put_f32(s, r.quality_loss);
         put_f32(s, r.route_loss);
     }
@@ -170,8 +178,9 @@ ObjHeader decode_header(const std::string& b, size_t* len) {
     char magic[4];
     r.bytes(magic, 4);
     if (std::memcmp(magic, kObjMagic, 4) != 0) throw StoreError(StoreError::Code::Corrupt, "bad object magic");
-    if (r.u32() != kObjFormat) throw StoreError(StoreError::Code::Corrupt, "unsupported object format");
-    ObjHeader h;
+    uint32_t version = r.u32();
+    if (version != 1 && version != 2) throw StoreError(StoreError::Code::Corrupt, "unsupported object format");
+    ObjHeader h; h.format_version = version;
     h.packing_version = r.u32();
     h.identity = r.str();
     h.fingerprint = r.str();
@@ -191,6 +200,7 @@ ObjHeader decode_header(const std::string& b, size_t* len) {
     h.recs.resize(h.count);
     for (ExpertRec& e : h.recs) {
         r.bytes(e.hash.data(), e.hash.size());
+        if (h.format_version >= 2) r.bytes(e.source_hash.data(), e.source_hash.size());
         e.quality_loss = r.f32();
         e.route_loss = r.f32();
     }
@@ -200,13 +210,9 @@ ObjHeader decode_header(const std::string& b, size_t* len) {
 
 // ------------------------------------------------------------------ file helpers
 std::string read_range(const std::string& path, uint64_t off, uint64_t n) {
-    FILE* f = std::fopen(path.c_str(), "rb");
-    if (!f) throw StoreError(StoreError::Code::Io, "cannot open " + path);
-    std::string s(static_cast<size_t>(n), '\0');
-    bool ok = fseeko(f, off_t(off), SEEK_SET) == 0;
-    size_t got = ok ? std::fread(&s[0], 1, s.size(), f) : 0;
-    std::fclose(f);
-    if (!ok || got != s.size()) throw StoreError(StoreError::Code::Corrupt, "short read from " + path);
+    std::string s(host_size(n), '\0');
+    try { platform::read_at(path, off, s.data(), s.size()); }
+    catch (const std::exception& e) { throw StoreError(StoreError::Code::Corrupt, e.what()); }
     return s;
 }
 
@@ -224,27 +230,17 @@ void write_durable(const std::string& path, const std::string& data, bool object
     if (object_write && first_object && g_crash == CrashPoint::PartialObjectWrite) {
         std::fwrite(data.data(), 1, data.size() / 2, f);
         std::fflush(f);
-        fsync(fileno(f));
+        platform::sync_file(f);
         crash_now();
     }
     bool ok = std::fwrite(data.data(), 1, data.size(), f) == data.size();
-    ok = ok && std::fflush(f) == 0 && fsync(fileno(f)) == 0;
+    ok = ok && std::fflush(f) == 0 && platform::sync_file(f) == 0;
     std::fclose(f);
     if (!ok) throw StoreError(StoreError::Code::Io, "write failed: " + path);
 }
 
-void fsync_dir(const std::string& dir) {
-    int fd = ::open(dir.c_str(), O_RDONLY);
-    if (fd < 0) throw StoreError(StoreError::Code::Io, "cannot open directory " + dir);
-    fsync(fd);
-    ::close(fd);
-}
-
-void rename_durable(const std::string& from, const std::string& to) {
-    std::error_code ec;
-    fs::rename(from, to, ec);
-    if (ec) throw StoreError(StoreError::Code::Io, "rename failed: " + from + " -> " + to);
-}
+void fsync_dir(const std::string& dir) { platform::sync_directory(dir); }
+void rename_durable(const std::string& from, const std::string& to) { platform::atomic_replace(from, to); }
 
 void remove_quiet(const std::string& p) {
     std::error_code ec;
@@ -365,6 +361,7 @@ struct ExpertStore::Impl {
     std::map<uint64_t, Loc> index;
     Counters ctr;
     mutable std::mutex mu;
+    std::unique_ptr<platform::FileLock> write_lock;
     uint64_t quarantine_seq = 0;
 
     static uint64_t ekey(uint32_t layer, uint32_t expert) { return (uint64_t(layer) << 32) | expert; }
@@ -390,10 +387,30 @@ struct ExpertStore::Impl {
             fs::create_directories(p, ec);
             if (ec) throw StoreError(StoreError::Code::Io, "cannot create " + p);
         }
+        write_lock = std::make_unique<platform::FileLock>(dir + "/lock");
+        if (cfg.weight_bits) {
+            if (cfg.calibration) {
+                cfg.calibration_id = cfg.calibration->fingerprint;
+                if (cfg.calibration_id.empty()) {
+                    cfg.calibration->save(dir + "/calibration.json");
+                    auto loaded = std::make_shared<compiler::Calibration>(compiler::Calibration::load(dir + "/calibration.json"));
+                    cfg.calibration = loaded; cfg.calibration_id = loaded->fingerprint;
+                } else cfg.calibration->save(dir + "/calibration.json");
+            } else {
+                auto loaded = std::make_shared<compiler::Calibration>(compiler::Calibration::load(dir + "/calibration.json"));
+                if (!cfg.calibration_id.empty() && cfg.calibration_id != loaded->fingerprint)
+                    throw StoreError(StoreError::Code::StaleCache, "calibration fingerprint changed");
+                cfg.calibration = loaded; cfg.calibration_id = loaded->fingerprint;
+            }
+            for (const auto& l : idx.experts) for (uint32_t e = 0; e < idx.geometry.n_expert; ++e)
+                cfg.calibration->for_expert(l.layer, e, idx.geometry.n_embd);
+        }
         identity_ = hex_str("kanjoos-expert-identity-v1|fp=" + m.fingerprint + "|arch=" + m.geometry.architecture +
                             "|pack=" + std::to_string(c.packing_version) + "|abi=" + c.kernel_abi +
                             "|cfg=" + c.runtime_config + "|extent=" + std::to_string(c.max_extent_bytes) +
-                            "|format=gguf-native");
+                            "|format=" + (cfg.weight_bits ? ("affine-" + std::to_string(cfg.weight_bits) + "-g" + std::to_string(cfg.group_size) +
+                            "-cal-" + cfg.calibration_id + "-gate-" + std::to_string(cfg.require_quality_gate) +
+                            "-err-" + std::to_string(cfg.max_relative_error) + "-snr-" + std::to_string(cfg.min_snr_db)) : "gguf-native"));
     }
 
     // ------------------------------------------------------------- desired layout
@@ -401,7 +418,10 @@ struct ExpertStore::Impl {
         std::vector<Key> keys;
         for (const gguf::ExpertLayer& l : idx.experts) {
             uint64_t eb = 0;
-            for (int k = 0; k < 3; ++k) eb += l.tensors[k].bytes_per_expert;
+            for (int k = 0; k < 3; ++k) {
+                const auto& t = idx.tensors[l.tensors[k].tensor_index];
+                eb += cfg.weight_bits ? compiler::packed_bytes(t.dims[0] * t.dims[1], {cfg.weight_bits, cfg.group_size, 21}) : l.tensors[k].bytes_per_expert;
+            }
             uint64_t n = l.tensors[0].n_expert;
             uint64_t per = eb == 0 ? n : std::max<uint64_t>(1, cfg.max_extent_bytes / eb);
             per = std::min(per, n);
@@ -426,7 +446,7 @@ struct ExpertStore::Impl {
         FILE* f = std::fopen(journal_path.c_str(), "a");
         if (!f) throw StoreError(StoreError::Code::Io, "cannot open journal");
         std::string l = line + "\n";
-        bool ok = std::fwrite(l.data(), 1, l.size(), f) == l.size() && std::fflush(f) == 0 && fsync(fileno(f)) == 0;
+        bool ok = std::fwrite(l.data(), 1, l.size(), f) == l.size() && std::fflush(f) == 0 && platform::sync_file(f) == 0;
         std::fclose(f);
         if (!ok) throw StoreError(StoreError::Code::Io, "journal write failed");
     }
@@ -464,7 +484,19 @@ struct ExpertStore::Impl {
     Obj load_object(const std::string& name) const {
         std::string path = obj_path(name);
         uint64_t fsz = file_size_of(path);
-        std::string prefix = read_range(path, 0, std::min<uint64_t>(fsz, kMaxHeaderBytes));
+        // Read the wire header exactly, never the first multi-megabyte part
+        // of an expert payload just to discover its directory (C4).
+        std::string prefix = read_range(path, 0, 12);
+        Reader base(prefix); char magic[4]; base.bytes(magic, 4); auto version = base.u32();
+        for (uint32_t field = 0; field < 3; ++field) {
+            auto length_bytes = read_range(path, prefix.size(), 4); Reader size_reader(length_bytes); uint32_t n = size_reader.u32();
+            if (n > kMaxHeaderBytes || prefix.size() + n + 4 > fsz) throw StoreError(StoreError::Code::Corrupt, "object header string exceeds file/bound");
+            auto text = read_range(path, prefix.size() + 4, n); prefix += length_bytes; prefix += text;
+        }
+        auto fixed = read_range(path, prefix.size(), 56); Reader fixed_reader(fixed); fixed_reader.u32(); fixed_reader.u32(); uint32_t count = fixed_reader.u32(); prefix += fixed;
+        uint64_t remaining = uint64_t(count) * (version == 2 ? 72 : 40) + 32;
+        if (remaining > kMaxHeaderBytes || prefix.size() + remaining > fsz) throw StoreError(StoreError::Code::Corrupt, "object records exceed file/header bound");
+        prefix += read_range(path, prefix.size(), remaining);
         size_t hlen = 0;
         ObjHeader h = decode_header(prefix, &hlen);
         if (prefix.size() < hlen + 32) throw StoreError(StoreError::Code::Corrupt, "object checksum missing");
@@ -518,7 +550,7 @@ struct ExpertStore::Impl {
             gguf::ByteSpan sp = idx.coalesced_extent(layer, ExpertKind(k), first, count);
             sizes[k] = sp.nbytes / count;
             src[k].resize(sp.nbytes);
-            if (fseeko(f, off_t(sp.abs_offset), SEEK_SET) != 0 ||
+            if (platform::seek_file(f, sp.abs_offset) != 0 ||
                 std::fread(&src[k][0], 1, src[k].size(), f) != src[k].size()) {
                 std::fclose(f);
                 throw StoreError(StoreError::Code::Io, "short read from GGUF source");
@@ -532,17 +564,66 @@ struct ExpertStore::Impl {
         h.up_type = el->tensors[1].ggml_type;
         h.down_type = el->tensors[2].ggml_type;
 
-        // Interleave per expert: gate_e | up_e | down_e.
+        // Read coalesced native extents once, then deterministically compile
+        // each logical expert. Full precision exists ONLY in this offline step.
         std::string payload;
-        payload.reserve(size_t(count) * h.expert_bytes());
         for (uint32_t e = 0; e < count; ++e) {
-            size_t start = payload.size();
-            payload.append(src[0], size_t(e) * sizes[0], sizes[0]);
-            payload.append(src[1], size_t(e) * sizes[1], sizes[1]);
-            payload.append(src[2], size_t(e) * sizes[2], sizes[2]);
-            ExpertRec r;
-            r.hash = sha256(payload.data() + start, payload.size() - start);
-            h.recs.push_back(r);
+            size_t start = payload.size(); ExpertRec r; Sha256 source;
+            for (int k = 0; k < 3; ++k) source.update(src[k].data() + size_t(e) * sizes[k], sizes[k]);
+            r.source_hash = source.finish();
+            auto expected = cfg.expected_source_hashes.find(ekey(layer, first + e));
+            if (expected != cfg.expected_source_hashes.end() && expected->second != hex(r.source_hash))
+                throw StoreError(StoreError::Code::Corrupt, "canonical source checksum mismatch before compilation");
+            if (!cfg.weight_bits) {
+                for (int k = 0; k < 3; ++k) payload.append(src[k], size_t(e) * sizes[k], sizes[k]);
+            } else {
+                compiler::QuantConfig quant{cfg.weight_bits, cfg.group_size, 21};
+                const auto& samples = cfg.calibration->for_expert(layer, first + e, idx.geometry.n_embd);
+                std::vector<float> w[3]; uint32_t rows[3], cols[3];
+                for (int k = 0; k < 3; ++k) {
+                    const auto& t = idx.tensors[el->tensors[k].tensor_index]; rows[k] = uint32_t(t.dims[1]); cols[k] = uint32_t(t.dims[0]);
+                    w[k].resize(size_t(rows[k]) * cols[k]); tensor::dequantize(t.type, reinterpret_cast<const uint8_t*>(src[k].data()) + size_t(e) * sizes[k], sizes[k], w[k].size(), w[k].data());
+                }
+                require(rows[0] == rows[1] && cols[0] == cols[1] && cols[2] == rows[0] && rows[2] == cols[0], "expert gate/up/down shapes do not agree");
+                std::vector<std::vector<float>> intermediates; std::vector<float> reference, candidate;
+                auto evaluate = [&](const float* gate, const float* up, const float* down, std::vector<float>& out, bool collect) {
+                    for (const auto& x : samples) {
+                        std::vector<float> g(rows[0]), u(rows[0]), a(rows[0]), y(rows[2]);
+                        compute::matmul({{reinterpret_cast<const uint8_t*>(gate), rows[0], cols[0], 0}, x.data(), g.data(), nullptr, 1});
+                        compute::matmul({{reinterpret_cast<const uint8_t*>(up), rows[1], cols[1], 0}, x.data(), u.data(), nullptr, 1});
+                        compute::activation({g.data(), u.data(), a.data(), a.size(), compute::Activation::Silu});
+                        compute::matmul({{reinterpret_cast<const uint8_t*>(down), rows[2], cols[2], 0}, a.data(), y.data(), nullptr, 1});
+                        out.insert(out.end(), y.begin(), y.end()); if (collect) intermediates.push_back(std::move(a));
+                    }
+                };
+                evaluate(w[0].data(), w[1].data(), w[2].data(), reference, true);
+                auto hidden_importance = compiler::activation_importance(samples, cols[0]);
+                compiler::PackedMatrix packed[3] = {
+                    compiler::pack(w[0].data(), rows[0], cols[0], quant, hidden_importance),
+                    compiler::pack(w[1].data(), rows[1], cols[1], quant, hidden_importance),
+                    compiler::pack(w[2].data(), rows[2], cols[2], quant, compiler::activation_importance(intermediates, cols[2]))};
+                auto a = compiler::materialize(packed[0]), b = compiler::materialize(packed[1]), c = compiler::materialize(packed[2]);
+                evaluate(a.data(), b.data(), c.data(), candidate, false); auto q = compiler::quality(reference, candidate);
+                r.quality_loss = float(q.relative_rmse);
+                if (cfg.require_quality_gate && (q.relative_rmse > cfg.max_relative_error || q.snr_db < cfg.min_snr_db))
+                    throw StoreError(StoreError::Code::Invalid, "expert quality gate failed at " + std::to_string(layer) + ":" + std::to_string(first + e) +
+                        " relative_rmse=" + std::to_string(q.relative_rmse) + " snr_db=" + std::to_string(q.snr_db));
+                // The next router measures expert-local routing sensitivity on
+                // the same balanced samples, rather than a fabricated zero loss.
+                auto gate_name = "blk." + std::to_string(layer + 1) + ".ffn_gate_inp.weight";
+                if (idx.find_tensor_info(gate_name)) {
+                    auto rw = router::load_router(source_path, idx, layer + 1);
+                    std::vector<float> ref_hidden = reference, test_hidden = candidate;
+                    for (size_t t = 0; t < samples.size(); ++t) for (uint32_t d = 0; d < cols[0]; ++d) {
+                        ref_hidden[t * cols[0] + d] += samples[t][d]; test_hidden[t * cols[0] + d] += samples[t][d];
+                    }
+                    r.route_loss = float(1 - router::compare_routing(router::route(rw, ref_hidden.data(), samples.size()), router::route(rw, test_hidden.data(), samples.size())).topk);
+                }
+                h.gate_bytes = packed[0].data.size(); h.up_bytes = packed[1].data.size(); h.down_bytes = packed[2].data.size();
+                h.gate_type = packed[0].type; h.up_type = packed[1].type; h.down_type = packed[2].type;
+                for (const auto& matrix : packed) payload.append(reinterpret_cast<const char*>(matrix.data.data()), matrix.data.size());
+            }
+            r.hash = sha256(payload.data() + start, payload.size() - start); h.recs.push_back(r);
         }
 
         std::string enc = encode_header(h);
@@ -568,6 +649,10 @@ struct ExpertStore::Impl {
             {"kernel_abi", cfg.kernel_abi},
             {"runtime_config", cfg.runtime_config},
             {"max_extent_bytes", std::to_string(cfg.max_extent_bytes)},
+            {"weight_bits", std::to_string(cfg.weight_bits)}, {"group_size", std::to_string(cfg.group_size)},
+            {"calibration_id", cfg.calibration_id.empty() ? "none" : cfg.calibration_id},
+            {"quality_gate", std::to_string(cfg.require_quality_gate)}, {"max_relative_error", std::to_string(cfg.max_relative_error)},
+            {"min_snr_db", std::to_string(cfg.min_snr_db)},
         };
     }
 
@@ -632,6 +717,9 @@ struct ExpertStore::Impl {
     // the canonical GGUF. Returns the new location of the expert.
     void repair(uint32_t obj_index) {
         Key key{committed[obj_index].hdr.layer, committed[obj_index].hdr.first, committed[obj_index].hdr.count};
+        const auto header = committed[obj_index].hdr;
+        for (uint32_t e = 0; e < header.count; ++e) if (header.format_version >= 2)
+            cfg.expected_source_hashes[ekey(header.layer, header.first + e)] = hex(header.recs[e].source_hash);
         quarantine(obj_index);
         pack_and_publish({key});
     }
@@ -768,7 +856,7 @@ struct ExpertStore::Impl {
         for (const Key& k : desired_keys()) {
             if (!have.count(k)) missing.push_back(k);
         }
-        if (!missing.empty()) {
+        if (!missing.empty() && !cfg.index_only) {
             pack_and_publish(missing);
         } else if (dirty || !have_manifest) {
             publish_manifest(generation_ + 1, committed);
@@ -789,6 +877,9 @@ struct ExpertStore::Impl {
     ExpertPayload read_expert_locked(ExpertId id) {
         for (int attempt = 0; attempt < 2; ++attempt) {
             auto it = index.find(ekey(id.layer, id.expert));
+            if (it == index.end() && cfg.index_only) {
+                for (const auto& key : desired_keys()) if (std::get<0>(key) == id.layer && id.expert >= std::get<1>(key) && id.expert < std::get<1>(key) + std::get<2>(key)) { pack_and_publish({key}); it = index.find(ekey(id.layer, id.expert)); break; }
+            }
             if (it == index.end()) throw std::out_of_range("expert not in store");
             const Obj& o = committed[it->second.obj];
             std::string bytes = read_expert_slot(o, it->second.slot);
@@ -798,6 +889,7 @@ struct ExpertStore::Impl {
                 p.gate_bytes = o.hdr.gate_bytes;
                 p.up_bytes = o.hdr.up_bytes;
                 p.down_bytes = o.hdr.down_bytes;
+        p.gate_type = o.hdr.gate_type; p.up_type = o.hdr.up_type; p.down_type = o.hdr.down_type;
                 return p;
             }
             ctr.checksum_failures++;
@@ -811,6 +903,10 @@ struct ExpertStore::Impl {
     std::vector<uint8_t> read_extent_locked(const Extent& e) {
         for (int attempt = 0; attempt < 2; ++attempt) {
             auto it = index.find(ekey(e.layer, e.first));
+            if (it == index.end() && cfg.index_only) {
+                auto key = Key{e.layer, e.first, e.count}; auto desired = desired_keys(); if (std::find(desired.begin(), desired.end(), key) == desired.end()) throw StoreError(StoreError::Code::Invalid, "extent is not in the canonical directory");
+                pack_and_publish({key}); it = index.find(ekey(e.layer, e.first));
+            }
             if (it == index.end()) throw std::out_of_range("extent not in store");
             uint32_t oi = it->second.obj;
             const Obj& o = committed[oi];
@@ -832,6 +928,17 @@ struct ExpertStore::Impl {
 };
 
 // ================================================================== public API
+StoreConfig ExpertStore::read_config(const std::string& dir) {
+    auto m = parse_manifest(read_range(dir + "/manifest", 0, file_size_of(dir + "/manifest"))); StoreConfig cfg;
+    auto get = [&](const std::string& key, const std::string& def) { auto it = m.fields.find(key); return it == m.fields.end() ? def : it->second; };
+    cfg.kernel_abi = get("kernel_abi", cfg.kernel_abi); cfg.runtime_config = get("runtime_config", cfg.runtime_config);
+    cfg.packing_version = uint32_t(std::stoul(get("packing_version", "1"))); cfg.max_extent_bytes = std::stoull(get("max_extent_bytes", "33554432"));
+    cfg.weight_bits = uint32_t(std::stoul(get("weight_bits", "0"))); cfg.group_size = uint32_t(std::stoul(get("group_size", "128")));
+    cfg.calibration_id = get("calibration_id", "none"); if (cfg.calibration_id == "none") cfg.calibration_id.clear();
+    cfg.require_quality_gate = get("quality_gate", "1") == "1"; cfg.max_relative_error = std::stod(get("max_relative_error", "0.15")); cfg.min_snr_db = std::stod(get("min_snr_db", "15")); return cfg;
+}
+StoreConfig ExpertStore::configuration() const { std::lock_guard<std::mutex> lock(impl_->mu); return impl_->cfg; }
+
 ExpertStore ExpertStore::open(const std::string& dir, const ModelIndex& idx, const StoreConfig& cfg, OpenMode mode) {
     auto impl = std::make_unique<Impl>();
     impl->init(dir, idx, cfg);
@@ -855,7 +962,8 @@ ExpertObject ExpertStore::lookup(ExpertId id) const {
     e.expert = id.expert;
     e.nvme_size = o.hdr.expert_bytes();
     e.nvme_offset = o.hdr.payload_offset + uint64_t(it->second.slot) * e.nvme_size;
-    e.packed_hash = r.hash;
+    e.packed_hash = r.hash; e.source_hash = r.source_hash;
+    if (o.hdr.gate_type & decode::kGroupTag) { e.precision = uint8_t(o.hdr.gate_type & 255); e.format = 2; e.group_size = uint16_t((o.hdr.gate_type >> 8) & 0xffff); }
     e.quality_loss = r.quality_loss;
     e.route_loss = r.route_loss;
     return e;
@@ -864,6 +972,13 @@ ExpertObject ExpertStore::lookup(ExpertId id) const {
 Extent ExpertStore::extent_of(ExpertId id) const {
     std::lock_guard<std::mutex> g(impl_->mu);
     auto it = impl_->index.find(Impl::ekey(id.layer, id.expert));
+    if (it == impl_->index.end() && impl_->cfg.index_only) {
+        for (const auto& key : impl_->desired_keys()) {
+            if (std::get<0>(key) != id.layer || id.expert < std::get<1>(key) || id.expert >= std::get<1>(key) + std::get<2>(key)) continue;
+            uint64_t bytes = 0; for (const auto& layer : impl_->idx.experts) if (layer.layer == id.layer) for (uint32_t k = 0; k < 3; ++k) { const auto& tensor = impl_->idx.tensors[layer.tensors[k].tensor_index]; bytes += impl_->cfg.weight_bits ? compiler::packed_bytes(tensor.dims[0] * tensor.dims[1], {impl_->cfg.weight_bits, impl_->cfg.group_size, 21}) : layer.tensors[k].bytes_per_expert; }
+            auto first = std::get<1>(key), count = std::get<2>(key); return {"canonical:" + hex_str(impl_->identity_ + "|" + std::to_string(id.layer) + "|" + std::to_string(first)), id.layer, first, count, 0, uint64_t(count) * bytes, bytes};
+        }
+    }
     if (it == impl_->index.end()) throw std::out_of_range("expert not in store");
     const Impl::Obj& o = impl_->committed[it->second.obj];
     Extent x;

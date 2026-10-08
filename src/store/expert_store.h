@@ -20,11 +20,13 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "gguf/model_index.h"
+#include "compiler/quant.h"
 
 namespace knj::store {
 
@@ -46,6 +48,16 @@ struct StoreConfig {
     std::string runtime_config = "default";   // any runtime setting that changes packed bytes
     uint64_t max_extent_bytes = 32ull << 20; // physical I/O unit target (C6: 2-32 MiB)
     uint32_t packing_version = 1;
+    uint32_t weight_bits = 0;  // 0 = GGUF native; 2/3/4/6/8 = affine kernel-native
+    uint32_t group_size = 128;
+    std::string calibration_id;
+    std::shared_ptr<const compiler::Calibration> calibration;
+    std::map<uint64_t, std::string> expected_source_hashes;
+    bool index_only = false; // defer missing-extent materialization to storage workers
+    bool require_quality_gate = true;
+    double max_relative_error = 0.15;
+    double min_snr_db = 15.0;
+
 };
 
 enum class OpenMode {
@@ -75,6 +87,7 @@ struct ExpertObject {
     uint64_t nvme_offset = 0;    // absolute file offset of this expert's payload in its object
     uint64_t nvme_size = 0;      // gate+up+down bytes
     std::array<uint8_t, 32> packed_hash{};
+    std::array<uint8_t, 32> source_hash{};
     float quality_loss = 0.0f;   // 0: bytes are identical to the source
     float route_loss = 0.0f;     // 0: bytes are identical to the source
 };
@@ -93,6 +106,7 @@ struct Extent {
 struct ExpertPayload {
     std::vector<uint8_t> bytes;  // gate | up | down
     uint64_t gate_bytes = 0, up_bytes = 0, down_bytes = 0;
+    uint32_t gate_type = 0, up_type = 0, down_type = 0;
 };
 
 // Crash injection for tests. When set, the process terminates with
@@ -111,6 +125,7 @@ class ExpertStore {
 public:
     // Opens (and recovers) the store at `dir`, creating and packing it from the
     // GGUF described by `idx` when it does not exist or is missing coverage.
+    static StoreConfig read_config(const std::string& dir);
     static ExpertStore open(const std::string& dir, const ModelIndex& idx,
                             const StoreConfig& cfg, OpenMode mode = OpenMode::Strict);
 
@@ -137,6 +152,7 @@ public:
     std::string identity() const;
     std::string directory() const;
     uint64_t generation() const;
+    StoreConfig configuration() const;
 
 private:
     struct Impl;
