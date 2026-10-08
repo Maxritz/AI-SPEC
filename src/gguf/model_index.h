@@ -9,6 +9,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "gguf/gguf_reader.h"
@@ -76,6 +77,20 @@ struct ModelIndex {
     std::vector<TensorInfo> tensors;   // copied from the header
     std::vector<ExpertLayer> experts;  // MoE layers, ascending layer order
     std::vector<std::string> trunk_tensors;  // names of resident (non-expert) tensors
+    std::vector<std::pair<std::string, Value>> metadata;  // GGUF KV entries, file order
+
+    const Value* find_kv_meta(const std::string& key) const {
+        for (const auto& kv : metadata) {
+            if (kv.first == key) return &kv.second;
+        }
+        return nullptr;
+    }
+    const TensorInfo* find_tensor_info(const std::string& name) const {
+        for (const TensorInfo& t : tensors) {
+            if (t.name == name) return &t;
+        }
+        return nullptr;
+    }
 
     bool has_experts() const { return !experts.empty(); }
 

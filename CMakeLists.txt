@@ -15,6 +15,14 @@ add_library(knj_substrate STATIC
   src/gguf/model_index.cpp)
 target_include_directories(knj_substrate PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
+add_library(knj_tensor STATIC
+  src/tensor/tensor_io.cpp)
+target_link_libraries(knj_tensor PUBLIC knj_substrate)
+
+add_library(knj_router STATIC
+  src/router/router.cpp)
+target_link_libraries(knj_router PUBLIC knj_tensor)
+
 add_library(knj_store STATIC
   src/store/expert_store.cpp)
 target_link_libraries(knj_store PUBLIC knj_substrate)
@@ -26,6 +34,8 @@ else()
 endif()
 target_compile_options(knj_substrate PRIVATE ${KNJ_WARNINGS})
 target_compile_options(knj_store PRIVATE ${KNJ_WARNINGS})
+target_compile_options(knj_tensor PRIVATE ${KNJ_WARNINGS})
+target_compile_options(knj_router PRIVATE ${KNJ_WARNINGS})
 
 add_executable(kanjoos-inspect src/tools/kanjoos_inspect.cpp)
 target_link_libraries(kanjoos-inspect PRIVATE knj_substrate)
@@ -43,3 +53,7 @@ add_executable(test_store tests/unit/test_store.cpp)
 target_link_libraries(test_store PRIVATE knj_store)
 target_include_directories(test_store PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit)
 add_test(NAME store COMMAND test_store)
+
+add_executable(test_router tests/unit/test_router.cpp)
+target_link_libraries(test_router PRIVATE knj_router)
+add_test(NAME router COMMAND test_router)

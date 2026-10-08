@@ -114,6 +114,7 @@ ModelIndex load_model_index(const std::string& path) {
     idx.data_offset = g.data_offset;
     idx.geometry = read_geometry(g);
     idx.tensors = g.tensors;
+    idx.metadata = g.kv;
 
     idx.fingerprint = g.fingerprint;
     idx.bytes_read_at_load = g.header_bytes_read;
