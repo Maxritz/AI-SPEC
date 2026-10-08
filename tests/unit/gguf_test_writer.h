@@ -42,6 +42,26 @@ inline std::string kv_arr_u32(const std::string& k, const std::vector<uint32_t>&
     return gstr(k) + u32le(9) + body;
 }
 
+inline std::string kv_arr_str(const std::string& k, const std::vector<std::string>& xs) {
+    std::string body = u32le(8) + u64le(xs.size());
+    for (const auto& x : xs) body += gstr(x);
+    return gstr(k) + u32le(9) + body;
+}
+inline std::string kv_arr_f32(const std::string& k, const std::vector<float>& xs) {
+    std::string body = u32le(6) + u64le(xs.size());
+    for (float f : xs) {
+        uint32_t b;
+        std::memcpy(&b, &f, 4);
+        body += u32le(b);
+    }
+    return gstr(k) + u32le(9) + body;
+}
+inline std::string kv_arr_i32(const std::string& k, const std::vector<int32_t>& xs) {
+    std::string body = u32le(5) + u64le(xs.size());
+    for (int32_t x : xs) body += u32le(uint32_t(x));
+    return gstr(k) + u32le(9) + body;
+}
+
 // ---- tensors ----
 struct Tensor {
     std::string name;

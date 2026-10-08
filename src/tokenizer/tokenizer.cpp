@@ -6,8 +6,18 @@
 #include "jinja/lexer.h"
 #include "jinja/parser.h"
 #include "jinja/runtime.h"
+#include <cstdio>
+#include <cstring>
 #include <limits>
 namespace knj::tokenizer {
+namespace {
+// Upstream loaders narrate every vocabulary load. Only warnings and errors are
+// forwarded; routine INFO/DEBUG chatter is dropped so engine output stays clean.
+void forward_log(ggml_log_level level, const char* text, void*) {
+    if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) { std::fputs(text, stderr); if (text[0] && text[std::strlen(text) - 1] != '\n') { std::fputc('\n', stderr); } }
+}
+void install_log_filter() { static const bool installed = [] { llama_log_set(forward_log, nullptr); return true; }(); (void)installed; }
+}  // namespace
 struct Tokenizer::Impl {
     llama_model* model = nullptr; const llama_vocab* vocab = nullptr; std::string identity, tmpl;
     std::unique_ptr<jinja::program> program;
@@ -25,6 +35,7 @@ Tokenizer::Tokenizer(const gguf::ModelIndex& index) : impl_(std::make_unique<Imp
     require(index.find_kv_meta("tokenizer.ggml.model") && index.find_kv_meta("tokenizer.ggml.tokens"), "GGUF is missing tokenizer metadata");
     // Canonical tokenizer is loaded vocabulary-only. No context is created,
     // no tensor payload is mapped/read, and this is NOT an inference backend.
+    install_log_filter();
     auto params = llama_model_default_params(); params.vocab_only = true; params.n_gpu_layers = 0; params.load_mode = LLAMA_LOAD_MODE_NONE; params.load_mtp = false;
     impl_->model = llama_model_load_from_file(index.path.c_str(), params); require(impl_->model, "canonical GGUF vocabulary loader rejected the model metadata"); impl_->vocab = llama_model_get_vocab(impl_->model);
     nlohmann::json tokenizer = nlohmann::json::object(); for (const auto& entry : index.metadata) if (entry.first.rfind("tokenizer.", 0) == 0) tokenizer[entry.first] = value_json(entry.second);

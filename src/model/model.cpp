@@ -96,7 +96,10 @@ Model::Model(const gguf::ModelIndex& i, Spec s, Runtime& r, transfer::Engine& t,
 const Tensor& Model::tensor(const std::string& name) const { auto i = tensors_.find(name); if (i == tensors_.end()) throw Error(ErrorCode::InvalidInput, "missing required resident tensor " + name); return i->second; }
 bool Model::has(const std::string& name) const { return tensors_.count(name) != 0; }
 Result Model::forward(kv::Session& session, kv::Cache& cache, attn::Attention& attn, const std::vector<int32_t>& tokens, bool all, const std::function<bool()>& cancel, const std::vector<uint32_t>& capture) { return run(session, cache, attn, tokens, all, cancel, capture, 0, spec_.layers, nullptr); }
-Result Model::mtp(kv::Session& session, kv::Cache& cache, attn::Attention& attn, int32_t token, const std::vector<float>& hidden, const std::function<bool()>& cancel) { require(spec_.mtp_layers && hidden.size() == spec_.hidden, "MTP requires resident learned nextn tensors and target hidden state"); return run(session, cache, attn, {token}, false, cancel, {}, spec_.layers, spec_.total_layers, &hidden); }
+Result Model::mtp(kv::Session& session, kv::Cache& cache, attn::Attention& attn, const std::vector<int32_t>& tokens, const std::vector<float>& hidden, const std::function<bool()>& cancel) {
+    require(spec_.mtp_layers && !tokens.empty() && hidden.size() == tokens.size() * spec_.hidden, "MTP requires resident nextn tensors and one target hidden row per token");
+    return run(session, cache, attn, tokens, false, cancel, {}, spec_.layers, spec_.total_layers, &hidden);
+}
 Result Model::run(kv::Session& session, kv::Cache& cache, attn::Attention& attn, const std::vector<int32_t>& tokens, bool all, const std::function<bool()>& cancel, const std::vector<uint32_t>& capture, uint32_t first, uint32_t end, const std::vector<float>* seed) {
     using namespace compute; require(!tokens.empty() && tokens.size() <= max_batch_, "forward batch outside reserved workspace"); for (auto token : tokens) require(token >= 0 && uint32_t(token) < spec_.vocabulary, "input token outside vocabulary");
     uint32_t n = uint32_t(tokens.size()), start = session.size(), h = spec_.hidden, qwidth = spec_.heads * spec_.key_dim, kwidth = spec_.kv_heads * spec_.key_dim, vwidth = spec_.kv_heads * spec_.value_dim, ff = spec_.max_intermediate;

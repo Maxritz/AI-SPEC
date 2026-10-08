@@ -38,7 +38,7 @@ public:
     Result forward(kv::Session&, kv::Cache&, attn::Attention&, const std::vector<int32_t>&, bool all_logits = false,
                    const std::function<bool()>& cancelled = {}, const std::vector<uint32_t>& capture_layers = {});
     std::vector<float> logits(const std::vector<float>& hidden);
-    Result mtp(kv::Session&, kv::Cache&, attn::Attention&, int32_t token, const std::vector<float>& previous_hidden, const std::function<bool()>& cancelled = {});
+    Result mtp(kv::Session&, kv::Cache&, attn::Attention&, const std::vector<int32_t>& tokens, const std::vector<float>& target_hidden_rows, const std::function<bool()>& cancelled = {});
     void tune(Autotuner&, bool allow_wmma);
 private:
     const gguf::ModelIndex& index_; Spec spec_; Runtime& runtime_; transfer::Engine& transfers_; profile::Profiler& profile_;

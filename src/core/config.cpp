@@ -61,6 +61,7 @@ void Config::validate() const {
     require(warm_fraction > 0 && warm_fraction <= .9 && kv_fraction > 0 && kv_fraction < 1 && min_free_gib >= 0, "invalid memory fractions");
     require(profile_floor && profile_floor <= 100000 && max_sessions && max_queued && max_body_bytes <= 64u << 20 && max_tokens && max_tokens <= UINT32_MAX, "invalid request limits");
     require(draft_width && draft_width <= max_draft_width && max_draft_width <= 64, "invalid speculation width");
+    require(drafter.empty() || drafter == "mtp", "spec.drafter must be empty or \"mtp\": the resident MTP head is the implemented drafter; learned DFlash/DSpark loaders are not implemented in this build");
     require(port > 0 && measured_h2d_gbs >= 0 && spill_wire_ms >= 0, "invalid server/transfer settings");
     require(kv_codec == "f32" || kv_codec == "f16" || kv_codec == "bf16" || kv_codec == "fp8" || kv_codec == "int8" || kv_codec == "int4", "unknown KV codec");
     require(allow_quantized_kv || (kv_codec != "fp8" && kv_codec != "int8" && kv_codec != "int4"), "quantized KV requires explicit precision-reduction opt-in");

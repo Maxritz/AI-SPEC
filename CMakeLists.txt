@@ -78,7 +78,8 @@ add_subdirectory(third_party/llama EXCLUDE_FROM_ALL)
 add_library(knj_jinja STATIC
   third_party/llama/common/json.cpp third_party/llama/common/jinja/lexer.cpp
   third_party/llama/common/jinja/parser.cpp third_party/llama/common/jinja/runtime.cpp
-  third_party/llama/common/jinja/string.cpp third_party/llama/common/jinja/value.cpp)
+  third_party/llama/common/jinja/string.cpp third_party/llama/common/jinja/value.cpp
+  third_party/llama/common/unicode.cpp)
 target_include_directories(knj_jinja SYSTEM PUBLIC third_party/llama/common PRIVATE third_party/llama/src third_party)
 target_link_libraries(knj_jinja PUBLIC llama)
 add_library(knj_tokenizer STATIC src/tokenizer/tokenizer.cpp)
@@ -103,6 +104,11 @@ if(KNJ_BUILD_TESTS)
     add_test(NAME ${name} COMMAND test_${name})
     set_tests_properties(${name} PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} TIMEOUT 90)
   endforeach()
+  add_executable(test_model tests/unit/test_model.cpp)
+  target_include_directories(test_model PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit)
+  target_link_libraries(test_model PRIVATE knj_inference)
+  add_test(NAME model COMMAND test_model)
+  set_tests_properties(model PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} TIMEOUT 600)
 endif()
 install(TARGETS kanjoos-inspect kanjoos-store RUNTIME DESTINATION bin)
 install(FILES kanjoos.toml DESTINATION share/kanjoos)
