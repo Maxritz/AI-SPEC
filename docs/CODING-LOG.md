@@ -611,3 +611,117 @@ below.
   here always produce this. Revisit if a real file violates it.
 - Fingerprint covers header/directory only. A tensor-data-only change does not
   change it. Per-object checksums in C6 must cover payloads.
+
+---
+
+## Session 2026-10-08 (cont.) — Phase 2: expert store (C5 Path A + C6), host
+
+Roadmap reference: `docs/08-roadmap.md` Phase 2 and `Readme.md` §37 Phase 2
+(immutable packed object format, manifest, checksums, atomic publish,
+corruption handling, cache invalidation). Worksheet: `ai-coder/c6-directory.md`
+(acceptance tests and worked micro-example). Crash and corruption requirements:
+`Readme.md` §32.
+
+### Phase 2 — expert store, host tier  ·  DONE (CPU, POSIX)
+
+**Believed at the time**
+
+- constraint: `Readme.md` §32 — crash-safe write order: temp object → checksum →
+  fsync → atomic publish → journal; on restart replay the journal, discard
+  incomplete objects, quarantine corrupt ones, preserve committed ones, never
+  expose a partial expert as valid.
+- constraint: `ai-coder/c6-directory.md` — checksum on every read, not only on
+  write; a mismatch quarantines and re-reads from the canonical checkpoint with
+  a visible counter; the object key includes the model fingerprint, quant
+  descriptor, precision/format/group size and packed hash.
+- constraint: `Readme.md` §8 — Path A (native GGUF cold path) is the compatibility
+  path; no BF16 intermediate on every miss.
+
+**Decision**
+
+- chose: content-addressed immutable objects, one per coalesced layer extent
+  (default target 32 MiB), named by SHA-256 of their header. The header holds a
+  SHA-256 per expert. Commit is a manifest rewritten to `manifest.tmp`, fsynced,
+  and renamed over `manifest`. A journal records `BEGIN gen`, `OBJ name` before
+  each temp write, and `COMMIT gen`.
+- chose: the logical unit is one expert (gate|up|down concatenated, the layout
+  Phase 1 reads from the GGUF). The physical unit is the extent. Packing reads
+  each tensor kind with one coalesced read per extent, then interleaves.
+- chose: a repair re-packs the damaged extent from the GGUF. Packing is
+  deterministic, so the repaired object has the same name and bytes as the
+  original. The test suite asserts this.
+- chose: identity = SHA-256 over fingerprint, arch, packing version, kernel ABI,
+  runtime config, extent size and format. Mismatch throws `StaleCache`,
+  `WrongModel` or `WrongArch`. Re-packing requires `OpenMode::RebuildIfStale`.
+- rejected: in-place overwrite of an object (violates immutability and makes a
+  crash mid-write destructive).
+- rejected: trusting the manifest alone at open. Object headers are verified at
+  open (name = hash of header, size = header-declared size). Payloads are verified
+  on every read.
+- falsified by: any test that reads a wrong or corrupt byte, any crash point that
+  leaves a partial object readable as committed.
+
+**Changed**
+
+- `src/store/expert_store.{h,cpp}` — the store: object codec, durable write,
+  journal, manifest, recovery, checksum-on-read, quarantine, repair, scrub,
+  telemetry counters.
+- `src/tools/kanjoos_store.cpp` — `kanjoos-store` CLI.
+- `tests/unit/test_store.cpp` — 13 test groups, 113 checks, including real process
+  kills (`fork` + `_Exit(77)`) at four crash points during a first pack and during
+  a repair.
+- `tests/tools/crosscheck_store.py` — packs a `gguf-py` MoE file, then dumps every
+  stored expert and compares it with the numpy arrays.
+- `BUILD.md` — build, test and cross-check instructions.
+- `CMakeLists.txt` — `knj_store`, `kanjoos-store`, `test_store`.
+
+**Verified**
+
+```
+$ cmake --build build                  # 0 warnings
+$ ./build/test_substrate               # 210 checks, 0 failed
+$ ./build/test_store                   # 113 checks, 0 failed
+$ g++ -fsanitize=address,undefined ... tests/unit/test_store.cpp && ./test_store   # clean
+$ python tests/tools/crosscheck_store.py build/kanjoos-store {32,64,128}
+alignment 32: 24/24 stored experts byte-identical to writer
+alignment 64: 24/24 stored experts byte-identical to writer
+alignment 128: 24/24 stored experts byte-identical to writer
+```
+
+**Measurements**
+
+| quantity | value | provenance |
+|---|---|---|
+| test_store wall time (includes 6 forked crash runs) | ~4 s | MEASURED |
+| per-expert read verifies SHA-256 of 24 KiB | every read | MEASURED (counters, tests) |
+| extents for 3 layers × 8 experts at 32 MiB target | 3 extents, one per layer | MEASURED (CLI) |
+| crash points exercised with real process death | 4 (first pack) + 2 (repair) | MEASURED |
+| fsync/power-loss durability | **not measured**: process death only; `fsync` is called, no power cut | NOT MEASURED |
+
+**Bugs found during this phase (fixed)**
+
+1. Test expected a new object name after repair; the packer is deterministic, so
+   the name is unchanged. The test was wrong; the invariant is now asserted.
+2. A scrub test corrupted the header padding (offset 4000), outside the payload.
+   Found because `verify_all` returned 0 where 2 was expected.
+3. Orphan counter counted a batch's temp file and object as one. It now counts
+   files removed.
+4. A crashed write of `manifest.tmp` was never deleted on open. Recovery now
+   removes it first.
+
+**Still open**
+
+- Windows: no implementation. `fsync`, `fork`, `fseeko` and `rename` semantics are
+  POSIX; the Windows platform layer (C24) is not written.
+- Power-loss durability is untested (no power-cut harness). Only process death is
+  tested.
+- Packing is Path A only: GGUF-native slices, precision 0, no quantisation and no
+  kernel-native layout (C5 Path B / W3 repack are later phases). `quality_loss`
+  and `route_loss` are therefore 0 by definition here.
+- Store reads are serialised by one mutex and use one `fopen` per read. This is
+  correct, but it is not the async transfer path (C11) and it does not overlap
+  with compute.
+- Phases 0 (hardware audit), 3 (RAM tier, pinned staging), 4–6 (VRAM slots,
+  transfer, residency), 8+ (expert GEMM, KV, attention) need the GPU target and
+  are not started. The router reference (Phase 7) is CPU-buildable and is the
+  next item.

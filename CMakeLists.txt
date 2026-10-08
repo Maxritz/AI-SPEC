@@ -8,24 +8,38 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
-# Host-only substrate (GGUF reader, model index). No GPU/HIP dependency:
-# see docs/07-build-platforms.md section 2.
+# Host-only layers (no GPU/HIP dependency): docs/07-build-platforms.md section 2.
 add_library(knj_substrate STATIC
   src/util/sha256.cpp
   src/gguf/gguf_reader.cpp
   src/gguf/model_index.cpp)
 target_include_directories(knj_substrate PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+add_library(knj_store STATIC
+  src/store/expert_store.cpp)
+target_link_libraries(knj_store PUBLIC knj_substrate)
+
 if(MSVC)
-  target_compile_options(knj_substrate PRIVATE /W4)
+  set(KNJ_WARNINGS /W4)
 else()
-  target_compile_options(knj_substrate PRIVATE -Wall -Wextra -Wpedantic)
+  set(KNJ_WARNINGS -Wall -Wextra -Wpedantic)
 endif()
+target_compile_options(knj_substrate PRIVATE ${KNJ_WARNINGS})
+target_compile_options(knj_store PRIVATE ${KNJ_WARNINGS})
 
 add_executable(kanjoos-inspect src/tools/kanjoos_inspect.cpp)
 target_link_libraries(kanjoos-inspect PRIVATE knj_substrate)
+
+add_executable(kanjoos-store src/tools/kanjoos_store.cpp)
+target_link_libraries(kanjoos-store PRIVATE knj_store)
 
 enable_testing()
 add_executable(test_substrate tests/unit/test_substrate.cpp)
 target_link_libraries(test_substrate PRIVATE knj_substrate)
 target_include_directories(test_substrate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit)
 add_test(NAME substrate COMMAND test_substrate)
+
+add_executable(test_store tests/unit/test_store.cpp)
+target_link_libraries(test_store PRIVATE knj_store)
+target_include_directories(test_store PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit)
+add_test(NAME store COMMAND test_store)
