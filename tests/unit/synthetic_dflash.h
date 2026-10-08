@@ -21,6 +21,7 @@ struct Dims {
     bool shared_kv = false, sinks = false, post_norms = false, out_scale = false, own_head = false, own_embedding = false;
     bool gelu = false, value_scale = false, embedding_scale = false, softcap = false, swa = false, scale_tensors = false;
     bool d2t = false, sample_from_anchor = true, confidence = true, causal = false;
+    uint32_t hyper_connections = 0;  // non-zero writes the DSV4-stage key that the loader must refuse
     uint32_t conv_kernel = 3, conv_group = 4, rank = 4, top_k = 3;
 };
 
@@ -136,6 +137,7 @@ inline std::string gguf_bytes(const Model& m, const std::string& name = "knj-syn
         spec.kv.push_back(testgguf::kv_u32("dflash.selector_rank", d.rank));
         spec.kv.push_back(testgguf::kv_u32("dflash.selector_top_k", d.top_k));
     }
+    if (d.hyper_connections) spec.kv.push_back(testgguf::kv_u32("dflash.hyper_connection.count", d.hyper_connections));
     if (d.value_scale) spec.kv.push_back(testgguf::kv_f32("dflash.attention.value_scale", .8f));
     if (d.embedding_scale) spec.kv.push_back(testgguf::kv_f32("dflash.embedding_scale", 1.5f));
     if (d.softcap) {

@@ -393,6 +393,10 @@ Drafter::Drafter(const gguf::ModelIndex& idx, const model::Spec& target) : impl_
         throw Error(ErrorCode::WrongArch, "drafter architecture is " + idx.geometry.architecture + ", expected dflash");
     }
     const std::string p = "dflash.";
+    // DSpark drafters built on DeepSeek-V4 stages (hyper-connections) use another block structure.
+    if (model::meta_u32(idx, p + "hyper_connection.count", 0) != 0) {
+        throw Error(ErrorCode::Unsupported, "DSV4-stage (hyper-connection) DSpark drafters are not implemented");
+    }
     s.block_size = model::meta_u32(idx, p + "block_size", 0, true);
     require(s.block_size >= 2 && s.block_size <= 512, "dflash.block_size outside the supported range");
     s.layers = idx.geometry.n_layer;

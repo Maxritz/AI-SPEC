@@ -239,6 +239,12 @@ void negative_cases(const std::string& dir, const std::string& tpath, const synt
     synthd::write(synthd::build(bad, target.d.hidden, target.d.vocab, 5), dir + "/bad-layer.gguf");
     throws_typed([&] { (void)dflash::Drafter(gguf::load_model_index(dir + "/bad-layer.gguf"), engine.spec()); }, ErrorCode::InvalidInput, "outside the target");
 
+    // DSV4-stage drafters are refused by name, not by a missing-tensor accident.
+    synthd::Dims dsv4;
+    dsv4.flavor = 2; dsv4.hyper_connections = 2; dsv4.own_head = true;
+    synthd::write(synthd::build(dsv4, target.d.hidden, target.d.vocab, 8), dir + "/dsv4.gguf");
+    throws_typed([&] { (void)dflash::Drafter(gguf::load_model_index(dir + "/dsv4.gguf"), engine.spec()); }, ErrorCode::Unsupported, "DSV4-stage");
+
     // DSpark without a confidence head cannot run a confidence threshold.
     synthd::Dims no_conf;
     no_conf.flavor = 2; no_conf.confidence = false; no_conf.own_head = true;

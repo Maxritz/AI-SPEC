@@ -33,7 +33,7 @@ from the model definition.
 | MTP (nextn) speculation with same-seed coupled verification | implemented | Verified (host): identical tokens to plain decoding for greedy and seeded sampling; acceptance on real models not measured |
 | Dense llama/qwen2/qwen3, qwen2moe, DeepSeek2 (MLA with unequal K/V widths) forward paths | implemented | Implemented, unverified |
 | Sliding-window attention layers | implemented | Implemented, unverified |
-| Speculation with DFlash / DFlash2 / DSpark drafters (one loader, arch `dflash`; Markov and confidence heads; selector lattice and dynamic conv; `d2t`; sinks, sliding windows, post norms, value/logit scales) | implemented | Verified (host): `drafter` suite, 5,368 checks. All 8 flavour/option configurations agree with the independent double-precision reference (K/V injection, incremental injection, truncation, drafts, confidences); drafted generation is token-identical to plain decoding for greedy and seeded sampling. Real drafter weights: not measured |
+| Speculation with DFlash / DFlash2 / DSpark drafters (one loader, arch `dflash`; Markov and confidence heads; selector lattice and dynamic conv; `d2t`; sinks, sliding windows, post norms, value/logit scales) | implemented | Verified (host): `drafter` suite, 5,370 checks. All 8 flavour/option configurations agree with the independent double-precision reference (K/V injection, incremental injection, truncation, drafts, confidences); drafted generation is token-identical to plain decoding for greedy and seeded sampling. Real drafter weights: not measured |
 | Recurrent, hybrid and DSV4 architectures | not implemented | refused by the architecture allow-list (see the section on open items below) |
 | Grouped expert kernels and WMMA paths (gfx1201), SIMT paths (gfx1031) | implemented in `kernels/` and `src/device/hip_backend.hip` | Implemented, unverified (not compiled) |
 | HIP backend build (`KNJ_ENABLE_HIP=ON`) | implemented | Not compiled in this environment |
@@ -90,6 +90,8 @@ These are not implemented in this tree. The architecture allow-list refuses them
   its own budget (`docs/02-components.md`, C14), and hybrid prefixes need replay-suffix
   rollback instead of prefix reuse (C12). DSV4 adds hyper-connections, sinkhorn routing
   and compressed attention. None of this has been started in the tree.
+- **DSV4-stage DSpark drafters** (drafters with `hyper_connection.count` > 0). The loader
+  refuses them with `Unsupported` and a named message.
 - **Real-model and GPU measurements.** Blocked by the sandbox (no weights, no GPU). The
   tooling is complete and documented.
 - **Windows execution.** The IOCP reader compiles for Windows with Zig but has not run.
