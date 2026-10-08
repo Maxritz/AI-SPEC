@@ -39,7 +39,7 @@ from the model definition.
 | HIP backend build (`KNJ_ENABLE_HIP=ON`) | implemented | Not compiled in this environment |
 | Measured CPU fallback for expert work (queue, SwiGLU rows, cancellation, cost bookkeeping) | implemented; scheduled only on GPU builds | Verified (host): direct unit checks in `model` against a double-precision reference. Routing decisions on a GPU: unverified |
 | Startup capability, oracle and tuning gates on a GPU | partial: a dense matmul variant is calibrated on GPU builds; no broader oracle | Implemented, unverified |
-| Linux io_uring and Windows IOCP lower-layer I/O | not implemented | workers use portable synchronous file I/O |
+| Native lower-layer I/O: Linux io_uring (raw syscalls, no liburing) and Windows IOCP behind `io.backend`; transfer workers, expert payload reads and trunk loads go through the selected reader | implemented | Verified (host, Linux 6.1): `io` suite, 740 checks, including concurrent random reads, short-read and missing-file errors, native-versus-portable byte equality, and the engine reporting io_uring; ThreadSanitizer clean. IOCP: compiled for `x86_64-windows-gnu` with `-Werror` (Zig), not executed on Windows |
 | HTTP server: generation, SSE streaming, sessions, suspend/resume, cancellation, bearer auth, limits, metrics | implemented | Verified (host): `server` (28 checks); Verified (manual) with `curl` on `kanjoos serve` |
 | `kanjoos generate`, `serve`, `doctor` | implemented | Verified (manual) |
 | Windows build | not run | `BUILD.md` lists the known Windows code paths |
@@ -61,6 +61,12 @@ from the model definition.
   their own, which requires the same hidden width. The `decoder_arch` compatibility
   is checked on tensor shapes, target layer ids and vocabulary, because the pinned
   llama graph carries no decoder-family key.
+- Expert payload reads hold the expert store's lock while they run, so the native
+  queue depth is used by trunk loads and transfer-level reads, but expert reads from
+  several workers still serialise in the store. Releasing that lock during I/O needs a
+  re-validation step in the repair path and is not done.
+- The io_uring reader opens files once per path and keeps the descriptors until the
+  reader is destroyed; reads are buffered (no `O_DIRECT`).
 - Requests with a drafter skip prefix reuse, like MTP requests, because the drafter
   state is derived from per-position target features that prefix pages do not carry.
 - Session checkpoints are resumed with plain decoding. MTP-enabled requests do not

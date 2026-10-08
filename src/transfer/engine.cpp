@@ -27,7 +27,8 @@ struct Engine::Impl {
     struct Task { std::shared_ptr<Transfer::State> state; std::function<device::Buffer(const std::shared_ptr<Transfer::State>&)> work; };
     mutable std::mutex mutex; std::condition_variable cv, drained; std::vector<Task> tasks; std::vector<std::thread> workers;
     bool stopping = false; uint64_t next = 1; uint32_t active = 0, max_queued;
-    Impl(Runtime& r, host::WarmPool& w, host::PinnedPool& p, profile::Profiler& prof, uint32_t count, uint32_t max) : runtime(r), warm(w), pinned(p), profile(prof), max_queued(max) {
+    std::shared_ptr<io::Reader> reader;
+    Impl(Runtime& r, host::WarmPool& w, host::PinnedPool& p, profile::Profiler& prof, uint32_t count, uint32_t max, std::shared_ptr<io::Reader> rd) : runtime(r), warm(w), pinned(p), profile(prof), max_queued(max), reader(std::move(rd)) {
         require(count && max, "invalid transfer worker configuration");
         for (uint32_t i = 0; i < count; ++i) workers.emplace_back([this] {
             platform::RoleScope storage(platform::ThreadRole::Storage);
@@ -78,10 +79,13 @@ struct Engine::Impl {
         auto peak = pinned.peak(), old = profile.counters.peak_pinned.load(); while (old < peak && !profile.counters.peak_pinned.compare_exchange_weak(old, peak)) {}
     }
 };
-Engine::Engine(Runtime& r, host::WarmPool& w, host::PinnedPool& p, profile::Profiler& prof, uint32_t n, uint32_t max) : impl_(std::make_unique<Impl>(r, w, p, prof, n, max)) {}
+Engine::Engine(Runtime& r, host::WarmPool& w, host::PinnedPool& p, profile::Profiler& prof, uint32_t n, uint32_t max, std::shared_ptr<io::Reader> reader)
+    : impl_(std::make_unique<Impl>(r, w, p, prof, n, max, reader ? std::move(reader) : io::make_reader(io::Preference::Auto, 32))) {}
+io::Capabilities Engine::io_capabilities() const { return impl_->reader->capabilities(); }
+std::shared_ptr<io::Reader> Engine::reader() const { return impl_->reader; }
 Engine::~Engine() = default;
 std::shared_ptr<Transfer> Engine::read(const std::string& path, uint64_t off, uint64_t n, Priority pri, uint64_t deadline) {
-    return impl_->submit([this, path, off, n](const auto&) { auto b = impl_->warm.allocate(n); platform::read_at(path, off, b.data, host_size(n)); impl_->profile.counters.nvme_read += n; return b; }, pri, deadline);
+    return impl_->submit([this, path, off, n](const auto&) { auto b = impl_->warm.allocate(n); impl_->reader->read(path, off, b.data, host_size(n)); impl_->profile.counters.nvme_read += n; return b; }, pri, deadline);
 }
 std::shared_ptr<Transfer> Engine::read_task(std::function<device::Buffer()> work, Priority pri, uint64_t deadline) { return impl_->submit([work = std::move(work)](const auto&) { return work(); }, pri, deadline); }
 std::shared_ptr<Transfer> Engine::h2d(device::Buffer dst, device::Buffer src, Priority pri, uint64_t deadline, std::vector<Ticket> deps) {
@@ -101,7 +105,7 @@ std::vector<std::shared_ptr<Transfer>> Engine::read_coalesced(std::vector<ReadSp
         require(spans[i].bytes && spans[i].destination.bytes >= spans[i].bytes, "invalid coalesced read destination"); size_t end = i + 1; uint64_t total = spans[i].bytes;
         while (end < spans.size() && spans[end].path == spans[i].path && spans[end].offset == checked_add(spans[i].offset, total) && spans[end].bytes <= max && total <= max - spans[end].bytes) { require(spans[end].destination.bytes >= spans[end].bytes, "short scatter destination"); total += spans[end].bytes; ++end; }
         auto group = std::vector<ReadSpan>(spans.begin() + i, spans.begin() + end);
-        out.push_back(impl_->submit([this, group, total](const auto&) { auto scratch = impl_->warm.allocate(total); platform::read_at(group.front().path, group.front().offset, scratch.data, host_size(total)); uint64_t off = 0; for (auto s : group) { std::memcpy(s.destination.data, static_cast<uint8_t*>(scratch.data) + off, host_size(s.bytes)); off += s.bytes; } impl_->profile.counters.nvme_read += total; return scratch; }, Priority::DemandRead, 0)); i = end;
+        out.push_back(impl_->submit([this, group, total](const auto&) { auto scratch = impl_->warm.allocate(total); impl_->reader->read(group.front().path, group.front().offset, scratch.data, host_size(total)); uint64_t off = 0; for (auto s : group) { std::memcpy(s.destination.data, static_cast<uint8_t*>(scratch.data) + off, host_size(s.bytes)); off += s.bytes; } impl_->profile.counters.nvme_read += total; return scratch; }, Priority::DemandRead, 0)); i = end;
     }
     return out;
 }

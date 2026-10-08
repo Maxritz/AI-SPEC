@@ -1,5 +1,6 @@
 #include "core/config.h"
 #include "core/error.h"
+#include "io/reader.h"
 #include "platform/platform.h"
 #include <algorithm>
 #include <cmath>
@@ -45,6 +46,7 @@ Config Config::load(const std::string& path) {
         UINT("inference.prefill_chunk", prefill_chunk) BYTES("inference.max_tokens", max_tokens, 1ull) REAL("inference.spill_wire_ms", spill_wire_ms)
         STR("spec.drafter", drafter) STR("spec.drafter_path", drafter_path) REAL("spec.draft_p_min", draft_p_min)
         UINT("spec.draft_min", draft_min) UINT("spec.draft_max", draft_max)
+        STR("io.backend", io_backend) UINT("io.queue_depth", io_queue_depth)
         UINT("spec.draft_width", draft_width) UINT("spec.max_draft_width", max_draft_width)
         { throw Error(ErrorCode::InvalidInput, "unknown config key " + k); }
 #undef STR
@@ -66,6 +68,8 @@ void Config::validate() const {
     require(drafter.empty() || drafter == "mtp" || drafter == "dflash" || drafter == "dspark", "spec.drafter must be \"\", \"mtp\", \"dflash\" or \"dspark\"");
     require((drafter == "dflash" || drafter == "dspark") == !drafter_path.empty(), "spec.drafter_path must name the DFlash/DSpark drafter GGUF exactly when spec.drafter is dflash or dspark");
     require(std::isfinite(draft_p_min) && draft_p_min >= 0 && draft_p_min <= 1, "spec.draft_p_min must be in [0, 1]");
+    io::parse_preference(io_backend);
+    require(io_queue_depth >= 1 && io_queue_depth <= 1024, "io.queue_depth must be between 1 and 1024");
     require(draft_max <= 64 && (draft_min <= (draft_max ? draft_max : 64u)), "invalid drafter draft length bounds");
     require(port > 0 && measured_h2d_gbs >= 0 && spill_wire_ms >= 0, "invalid server/transfer settings");
     require(kv_codec == "f32" || kv_codec == "f16" || kv_codec == "bf16" || kv_codec == "fp8" || kv_codec == "int8" || kv_codec == "int4", "unknown KV codec");

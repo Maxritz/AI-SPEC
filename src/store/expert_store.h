@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 
+#include "io/reader.h"
 #include "gguf/model_index.h"
 #include "compiler/quant.h"
 
@@ -139,11 +140,12 @@ public:
 
     // Reads one expert. Verifies its SHA-256; on mismatch quarantines the
     // object, re-packs the extent from the GGUF and returns the repaired bytes.
-    ExpertPayload read_expert(ExpertId id);
+    // The optional reader performs the payload read (native lower layer); nullptr uses the portable path.
+    ExpertPayload read_expert(ExpertId id, io::Reader* reader = nullptr);
 
     // Reads a whole coalesced extent with a single file read. Every expert in
     // it is verified; a mismatch triggers the same repair path as read_expert.
-    std::vector<uint8_t> read_extent(const Extent& e);
+    std::vector<uint8_t> read_extent(const Extent& e, io::Reader* reader = nullptr);
 
     // Full scrub of every committed object. Returns the number repaired.
     size_t verify_all();

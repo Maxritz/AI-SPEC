@@ -1,5 +1,6 @@
 #pragma once
 #include "core/runtime.h"
+#include "io/reader.h"
 #include "host/pools.h"
 #include <atomic>
 #include <future>
@@ -26,7 +27,9 @@ private:
 struct ReadSpan { std::string path; uint64_t offset = 0, bytes = 0; device::Buffer destination; };
 class Engine {
 public:
-    Engine(Runtime&, host::WarmPool&, host::PinnedPool&, profile::Profiler&, uint32_t workers = 2, uint32_t max_queued = 256);
+    // The reader performs every worker-side file read; nullptr selects the automatic native backend.
+    Engine(Runtime&, host::WarmPool&, host::PinnedPool&, profile::Profiler&, uint32_t workers = 2, uint32_t max_queued = 256,
+           std::shared_ptr<io::Reader> reader = nullptr);
     ~Engine();
     std::shared_ptr<Transfer> read(const std::string&, uint64_t off, uint64_t bytes, Priority = Priority::DemandRead, uint64_t deadline_ns = 0);
     std::shared_ptr<Transfer> read_task(std::function<device::Buffer()>, Priority, uint64_t deadline_ns = 0);
@@ -39,6 +42,8 @@ public:
     void cancel_prefetch();
     void flush();
     size_t queued() const;
+    io::Capabilities io_capabilities() const;
+    std::shared_ptr<io::Reader> reader() const;
 private:
     struct Impl; std::unique_ptr<Impl> impl_;
 };

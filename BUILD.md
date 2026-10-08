@@ -88,6 +88,10 @@ keys are errors. The keys most people need:
   with `spec.drafter_path` naming the drafter GGUF), `spec.draft_width`,
   `spec.draft_max`, `spec.draft_min`, `spec.draft_p_min` (confidence floor; DSpark
   requires a confidence head for a non-zero floor)
+- `io.backend` (`auto`, `portable`, `io_uring` on Linux, `iocp` on Windows) and
+  `io.queue_depth`. `auto` uses the native backend when the kernel or OS provides it and
+  records the reason otherwise (`kanjoos doctor` prints the choice); an explicit native
+  request fails with a typed error when the backend is unavailable.
 - `server.host`, `server.port`, `server.api_key_env` (the bearer token is read from
   this environment variable; when it is set every `/v1` route except `/v1/health`
   requires `Authorization: Bearer <token>`), `server.max_sessions`,
@@ -126,6 +130,9 @@ Errors are returned as `{"error": {"code": ..., "message": ...}}` with HTTP 400
 
 - Windows: the code has platform paths (`psapi`, `ws2_32`, `_putenv_s`), but no
   Windows build has been run. Expect compiler and link fixes on first build.
+- The IOCP reader (`src/io/iocp.cpp`) and the reader dispatcher were compiled for
+  `x86_64-windows-gnu` with `-Wall -Wextra -Wpedantic -Werror` (Zig 0.17); they were
+  not linked or run on Windows.
 - HIP: `knj_hip` compiles only with `KNJ_ENABLE_HIP=ON`. Kernel and ISA choices
   follow the RDNA documents in `ai-coder/`. Nothing in the HIP path has been
   compiled or executed in this tree.

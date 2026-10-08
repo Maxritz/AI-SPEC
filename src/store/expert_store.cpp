@@ -865,16 +865,26 @@ struct ExpertStore::Impl {
     }
 
     // ------------------------------------------------------------- reads
-    std::string read_expert_slot(const Obj& o, uint32_t slot) const {
+    // Payload reads go through the reader when one is given (native lower layer) and through
+    // the portable path otherwise. Header, journal and manifest reads always use the portable path.
+    static std::string read_payload(io::Reader* reader, const std::string& path, uint64_t off, uint64_t n) {
+        if (!reader) return read_range(path, off, n);
+        std::string s(host_size(n), '\0');
+        try { reader->read(path, off, s.data(), s.size()); }
+        catch (const std::exception& e) { throw StoreError(StoreError::Code::Corrupt, e.what()); }
+        return s;
+    }
+
+    std::string read_expert_slot(const Obj& o, uint32_t slot, io::Reader* reader) const {
         uint64_t eb = o.hdr.expert_bytes();
-        return read_range(obj_path(o.name), o.hdr.payload_offset + uint64_t(slot) * eb, eb);
+        return read_payload(reader, obj_path(o.name), o.hdr.payload_offset + uint64_t(slot) * eb, eb);
     }
 
     bool expert_ok(const Obj& o, uint32_t slot, const std::string& bytes) const {
         return sha256(bytes.data(), bytes.size()) == o.hdr.recs[slot].hash;
     }
 
-    ExpertPayload read_expert_locked(ExpertId id) {
+    ExpertPayload read_expert_locked(ExpertId id, io::Reader* reader) {
         for (int attempt = 0; attempt < 2; ++attempt) {
             auto it = index.find(ekey(id.layer, id.expert));
             if (it == index.end() && cfg.index_only) {
@@ -882,7 +892,7 @@ struct ExpertStore::Impl {
             }
             if (it == index.end()) throw std::out_of_range("expert not in store");
             const Obj& o = committed[it->second.obj];
-            std::string bytes = read_expert_slot(o, it->second.slot);
+            std::string bytes = read_expert_slot(o, it->second.slot, reader);
             if (expert_ok(o, it->second.slot, bytes)) {
                 ExpertPayload p;
                 p.bytes.assign(bytes.begin(), bytes.end());
@@ -900,7 +910,7 @@ struct ExpertStore::Impl {
         throw StoreError(StoreError::Code::Corrupt, "expert payload still corrupt after repair");
     }
 
-    std::vector<uint8_t> read_extent_locked(const Extent& e) {
+    std::vector<uint8_t> read_extent_locked(const Extent& e, io::Reader* reader) {
         for (int attempt = 0; attempt < 2; ++attempt) {
             auto it = index.find(ekey(e.layer, e.first));
             if (it == index.end() && cfg.index_only) {
@@ -910,8 +920,8 @@ struct ExpertStore::Impl {
             if (it == index.end()) throw std::out_of_range("extent not in store");
             uint32_t oi = it->second.obj;
             const Obj& o = committed[oi];
-            std::string bytes = read_range(obj_path(o.name), o.hdr.payload_offset + uint64_t(it->second.slot) * o.hdr.expert_bytes(),
-                                           uint64_t(e.count) * o.hdr.expert_bytes());
+            std::string bytes = read_payload(reader, obj_path(o.name), o.hdr.payload_offset + uint64_t(it->second.slot) * o.hdr.expert_bytes(),
+                                             uint64_t(e.count) * o.hdr.expert_bytes());
             bool ok = true;
             uint64_t eb = o.hdr.expert_bytes();
             for (uint32_t s = 0; s < e.count && ok; ++s) {
@@ -1009,14 +1019,14 @@ std::vector<Extent> ExpertStore::extents() const {
     return out;
 }
 
-ExpertPayload ExpertStore::read_expert(ExpertId id) {
+ExpertPayload ExpertStore::read_expert(ExpertId id, io::Reader* reader) {
     std::lock_guard<std::mutex> g(impl_->mu);
-    return impl_->read_expert_locked(id);
+    return impl_->read_expert_locked(id, reader);
 }
 
-std::vector<uint8_t> ExpertStore::read_extent(const Extent& e) {
+std::vector<uint8_t> ExpertStore::read_extent(const Extent& e, io::Reader* reader) {
     std::lock_guard<std::mutex> g(impl_->mu);
-    return impl_->read_extent_locked(e);
+    return impl_->read_extent_locked(e, reader);
 }
 
 size_t ExpertStore::verify_all() {

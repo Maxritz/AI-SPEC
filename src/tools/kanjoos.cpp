@@ -3,6 +3,7 @@
 #include "core/error.h"
 #include "device/backend.h"
 #include "gguf/model_index.h"
+#include "io/reader.h"
 #include "inference/engine.h"
 #include "model/model.h"
 #include "platform/platform.h"
@@ -248,6 +249,13 @@ int cmd_doctor(int argc, char** argv) {
     report["toolchain"] = toolchain;
     auto memory = knj::platform::memory_info();
     report["host"] = {{"memory_total_bytes", memory.total}, {"memory_available_bytes", memory.available}};
+    try {
+        knj::Config config = load_config(a);
+        auto io = knj::io::make_reader(knj::io::parse_preference(config.io_backend), config.io_queue_depth)->capabilities();
+        report["io"] = {{"requested", config.io_backend}, {"backend", io.backend}, {"native", io.native}, {"queue_depth", io.queue_depth}, {"detail", io.detail}};
+    } catch (const std::exception& e) {
+        report["io"] = {{"error", e.what()}};
+    }
     if (a.values.count("--model")) {
         try {
             auto index = knj::gguf::load_model_index(a.get("--model"));

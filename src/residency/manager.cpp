@@ -55,7 +55,7 @@ struct Manager::Impl {
             auto extent = store.extent_of(id); e.extent = extent.name;
             auto reading = reads.find(extent.name);
             if (reading == reads.end()) {
-                auto t = transfers.read_task([this, extent] { auto data = store.read_extent(extent); auto buffer = warm.allocate(data.size()); std::memcpy(buffer.data, data.data(), data.size()); profile.counters.nvme_read += data.size(); return buffer; }, prefetch ? transfer::Priority::PrefetchRead : transfer::Priority::DemandRead);
+                auto t = transfers.read_task([this, extent, reader = transfers.reader()] { auto data = store.read_extent(extent, reader.get()); auto buffer = warm.allocate(data.size()); std::memcpy(buffer.data, data.data(), data.size()); profile.counters.nvme_read += data.size(); return buffer; }, prefetch ? transfer::Priority::PrefetchRead : transfer::Priority::DemandRead);
                 reading = reads.emplace(extent.name, Read{extent, std::move(t)}).first;
             } else if (!prefetch) reading->second.transfer->escalate(transfer::Priority::DemandRead);
             transition(id, e, State::LoadingNvme);

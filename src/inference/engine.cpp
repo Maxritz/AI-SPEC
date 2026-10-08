@@ -43,7 +43,8 @@ Engine::Engine(const std::string& path, Config config, int device) : config_(std
     require(!index_.has_experts() || max_expert <= budget_.warm, "warm tier cannot hold one packed expert");
     warm_ = std::make_unique<host::WarmPool>(budget_.warm);
     pinned_ = std::make_unique<host::PinnedPool>(backend_, budget_.staging, config_.staging_chunk_bytes);
-    transfers_ = std::make_unique<transfer::Engine>(runtime_, *warm_, *pinned_, profile_, config_.io_workers, config_.max_queued);
+    transfers_ = std::make_unique<transfer::Engine>(runtime_, *warm_, *pinned_, profile_, config_.io_workers, config_.max_queued,
+                                                    io::make_reader(io::parse_preference(config_.io_backend), config_.io_queue_depth));
     runtime_.measure_floor(config_.profile_floor);
     if (backend_->caps().is_gpu) {
         auto host = backend_->allocate(std::min<uint64_t>(budget_.staging, 8ull << 20), device::MemoryKind::Pinned), device_buf = backend_->allocate(host.bytes);
@@ -364,6 +365,10 @@ void Engine::pressure() {
 nlohmann::json Engine::report() const {
     auto result = profile_.report();
     result["speculation"] = speculation_.report();
+    {
+        const auto io = transfers_->io_capabilities();
+        result["io"] = {{"backend", io.backend}, {"native", io.native}, {"queue_depth", io.queue_depth}, {"detail", io.detail}};
+    }
     if (drafter_) { result["drafter"] = {{"flavor", dflash::flavor_name(drafter_->spec().flavor)}, {"block_size", drafter_->spec().block_size}, {"draft_max", drafter_max_}, {"target_layers", drafter_->spec().target_layers}, {"host_bytes", drafter_->host_bytes()}}; }
     if (predictor_) { auto p = predictor_->stats(); result["prediction"] = {{"predicted", p.predicted}, {"used", p.used}, {"late", p.late}, {"wasted_bytes", p.wasted_bytes}, {"hit_rate", p.hit_rate()}, {"horizon", predictor_->horizon()}}; }
     result["classification"] = config_.force_cold && store_ ? "storage-bound" : backend_->caps().is_gpu ? "native-gpu" : "host-reference";

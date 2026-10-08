@@ -23,6 +23,10 @@ staging_chunks = 4
 io_workers = 2
 measured_h2d_gbs = 0.0
 adaptive_prefetch = false
+[io]
+backend = "auto"       # auto | portable | io_uring (Linux) | iocp (Windows); explicit native requests fail when unavailable
+queue_depth = 32        # in-flight reads for a native backend (1..1024)
+
 [nvme]
 quota_mib = 0
 store_dir = ""
