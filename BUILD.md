@@ -84,8 +84,10 @@ keys are errors. The keys most people need:
 - `kv.codec` (`f32`, `f16`, `bf16`, `fp8`, `int8`, `int4`); the last three require
   `kv.allow_precision_reduction = true`
 - `ram.warm_mib` / `ram.warm_fraction`, `nvme.store_dir`, `nvme.rebuild_stale_store`
-- `spec.drafter` (`""` or `"mtp"`; learned DFlash/DSpark drafters are not implemented
-  and are refused), `spec.draft_width`
+- `spec.drafter` (`""`, `"mtp"` for the resident MTP head, or `"dflash"` / `"dspark"`
+  with `spec.drafter_path` naming the drafter GGUF), `spec.draft_width`,
+  `spec.draft_max`, `spec.draft_min`, `spec.draft_p_min` (confidence floor; DSpark
+  requires a confidence head for a non-zero floor)
 - `server.host`, `server.port`, `server.api_key_env` (the bearer token is read from
   this environment variable; when it is set every `/v1` route except `/v1/health`
   requires `Authorization: Bearer <token>`), `server.max_sessions`,

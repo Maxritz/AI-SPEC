@@ -16,7 +16,8 @@ public:
     explicit Reference(const synth::Model& m) : m_(m) {}
 
     // Logits for every position of `tokens` (full causal recompute).
-    std::vector<Vec> logits(const std::vector<int32_t>& tokens) const {
+    // When `inputs` is given it receives, per layer, the residual stream entering that layer (one row per position).
+    std::vector<Vec> logits(const std::vector<int32_t>& tokens, std::vector<std::vector<Vec>>* inputs = nullptr) const {
         const auto& d = m_.d;
         const size_t n = tokens.size();
         const uint32_t h = d.hidden;
@@ -24,6 +25,7 @@ public:
         const auto& emb = data("token_embd.weight");
         for (size_t t = 0; t < n; ++t) for (uint32_t i = 0; i < h; ++i) x[t][i] = emb.at(size_t(tokens[t]) * h + i);
         for (uint32_t l = 0; l < d.layers; ++l) {
+            if (inputs) inputs->push_back(x);
             const std::string p = "blk." + std::to_string(l) + ".";
             std::vector<Vec> q(n), k(n), v(n);
             for (size_t t = 0; t < n; ++t) {

@@ -131,6 +131,13 @@ Result Model::run(kv::Session& session, kv::Cache& cache, attn::Attention& attn,
     Result result; result.rows = n; std::set<uint64_t> union_ids;
     for (uint32_t layer = first; layer < end; ++layer) {
         if (cancel && cancel()) { last->wait(); runtime_.poll(); throw Error(ErrorCode::Cancelled, "cancelled at forward layer boundary"); }
+        // Captured rows are the residual stream entering this layer (llama's layer input),
+        // which is the feature the DFlash drafter reads from its target layers.
+        if (std::find(capture.begin(), capture.end(), layer) != capture.end()) {
+            auto host = runtime_.backend().allocate(uint64_t(n) * h * 4, device::MemoryKind::Pageable);
+            runtime_.copy(host, x, device::CopyKind::D2H, {last})->wait();
+            result.captured[layer].assign(host.as<float>(), host.as<float>() + uint64_t(n) * h);
+        }
         auto prefix = "blk." + std::to_string(layer) + ".";
         if (predictor_ && residency_) { auto pred = predictor_->predict(layer, 3); for (auto id : pred.candidates) if (id.layer < end && index_.find_tensor_info("blk." + std::to_string(id.layer) + ".ffn_gate_exps.weight")) residency_->prefetch(id, false); }
         last = norm(x, normed, prefix + "attn_norm.weight", n, h, last, layer); Ticket qdone, kdone;
@@ -186,7 +193,7 @@ Result Model::run(kv::Session& session, kv::Cache& cache, attn::Attention& attn,
             }
         } else last = dense_ffn("", ffnout, last);
         last = add(y, ffnout, x, last, layer);
-        if (std::find(capture.begin(), capture.end(), layer) != capture.end()) { auto host = runtime_.backend().allocate(uint64_t(n) * h * 4, device::MemoryKind::Pageable); runtime_.copy(host, x, device::CopyKind::D2H, {last})->wait(); result.captured[layer].assign(host.as<float>(), host.as<float>() + uint64_t(n) * h); }
+
         runtime_.poll();
     }
     auto hidden_host = runtime_.backend().allocate(uint64_t(n) * h * 4, device::MemoryKind::Pageable); auto hidden_copy = runtime_.copy(hidden_host, x, device::CopyKind::D2H, {last});
@@ -201,6 +208,36 @@ std::vector<float> Model::logits(const std::vector<float>& hidden) {
     require(hidden.size() == spec_.hidden, "LM head hidden dimension mismatch"); Frame frame{workspace_}; auto input = frame.take(hidden.size() * 4), normalized = frame.take(input.bytes), out = frame.take(spec_.vocabulary * 4); auto host = runtime_.backend().allocate(input.bytes, device::MemoryKind::Pageable); std::memcpy(host.data, hidden.data(), input.bytes); auto copied = runtime_.copy(input, host, device::CopyKind::H2D);
     NormPlan norm{input.as<float>(), normalized.as<float>(), tensor("output_norm.weight").buffer.as<float>(), nullptr, 1, spec_.hidden, spec_.epsilon}; auto n = runtime_.submit({profile::OpClass::Norm, runtime_.compute_stream(), [norm](device::Backend& b, auto s) { b.norm(norm, s); }, {copied}, {workspace_.owner}, spec_.layers, "head-rmsnorm-v1"});
     MatmulPlan p{tensor(has("output.weight") ? "output.weight" : "token_embd.weight").matrix, normalized.as<float>(), out.as<float>(), nullptr, 1, variant_}; auto m = runtime_.submit({profile::OpClass::Head, runtime_.compute_stream(), [p](device::Backend& b, auto s) { b.matmul(p, s); }, {n}, {workspace_.owner}, spec_.layers, "head-matmul-v1"}); auto result = runtime_.backend().allocate(out.bytes, device::MemoryKind::Pageable); runtime_.copy(result, out, device::CopyKind::D2H, {m})->wait(); runtime_.poll(); return {result.as<float>(), result.as<float>() + spec_.vocabulary};
+}
+std::vector<float> Model::embed_rows(const std::vector<int32_t>& tokens) {
+    using namespace compute;
+    require(!tokens.empty() && tokens.size() <= max_batch_, "embedding batch outside reserved workspace");
+    const uint32_t n = uint32_t(tokens.size()), h = spec_.hidden;
+    for (auto token : tokens) require(token >= 0 && uint32_t(token) < spec_.vocabulary, "input token outside vocabulary");
+    Frame frame{workspace_};
+    auto ids = frame.take(uint64_t(n) * 4), out = frame.take(uint64_t(n) * h * 4);
+    auto host = runtime_.backend().allocate(ids.bytes, device::MemoryKind::Pageable); std::memcpy(host.data, tokens.data(), ids.bytes);
+    auto copied = runtime_.copy(ids, host, device::CopyKind::H2D);
+    EmbedPlan plan{tensor("token_embd.weight").matrix, ids.as<int32_t>(), out.as<float>(), n, 1.0f};
+    auto e = runtime_.submit({profile::OpClass::Embed, runtime_.compute_stream(), [plan](device::Backend& b, auto s) { b.embed(plan, s); }, {copied}, {workspace_.owner}, spec_.layers, "drafter-embed-v1"});
+    auto result = runtime_.backend().allocate(out.bytes, device::MemoryKind::Pageable);
+    runtime_.copy(result, out, device::CopyKind::D2H, {e})->wait(); runtime_.poll();
+    return std::vector<float>(result.as<float>(), result.as<float>() + uint64_t(n) * h);
+}
+std::vector<float> Model::head_rows(const std::vector<float>& hidden) {
+    using namespace compute;
+    require(!hidden.empty() && hidden.size() % spec_.hidden == 0, "LM head rows must be whole hidden vectors");
+    const uint32_t rows = uint32_t(hidden.size() / spec_.hidden);
+    require(rows <= max_batch_, "LM head batch outside reserved workspace");
+    Frame frame{workspace_};
+    auto input = frame.take(uint64_t(hidden.size()) * 4), out = frame.take(uint64_t(rows) * spec_.vocabulary * 4);
+    auto host = runtime_.backend().allocate(input.bytes, device::MemoryKind::Pageable); std::memcpy(host.data, hidden.data(), input.bytes);
+    auto copied = runtime_.copy(input, host, device::CopyKind::H2D);
+    MatmulPlan p{tensor(has("output.weight") ? "output.weight" : "token_embd.weight").matrix, input.as<float>(), out.as<float>(), nullptr, rows, variant_};
+    auto m = runtime_.submit({profile::OpClass::Head, runtime_.compute_stream(), [p](device::Backend& b, auto s) { b.matmul(p, s); }, {copied}, {workspace_.owner}, spec_.layers, "drafter-head-matmul-v1"});
+    auto result = runtime_.backend().allocate(out.bytes, device::MemoryKind::Pageable);
+    runtime_.copy(result, out, device::CopyKind::D2H, {m})->wait(); runtime_.poll();
+    return std::vector<float>(result.as<float>(), result.as<float>() + uint64_t(rows) * spec_.vocabulary);
 }
 void Model::tune(Autotuner& tuner, bool allow_wmma) {
     if (!runtime_.backend().caps().is_gpu) return;

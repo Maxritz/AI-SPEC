@@ -33,8 +33,8 @@ from the model definition.
 | MTP (nextn) speculation with same-seed coupled verification | implemented | Verified (host): identical tokens to plain decoding for greedy and seeded sampling; acceptance on real models not measured |
 | Dense llama/qwen2/qwen3, qwen2moe, DeepSeek2 (MLA with unequal K/V widths) forward paths | implemented | Implemented, unverified |
 | Sliding-window attention layers | implemented | Implemented, unverified |
-| Speculation with DFlash / DSpark drafters | not implemented | `spec.drafter` values other than `""`/`"mtp"` are refused with an explicit error |
-| Recurrent, hybrid and DSV4 architectures | not implemented | refused by the architecture allow-list |
+| Speculation with DFlash / DFlash2 / DSpark drafters (one loader, arch `dflash`; Markov and confidence heads; selector lattice and dynamic conv; `d2t`; sinks, sliding windows, post norms, value/logit scales) | implemented | Verified (host): `drafter` suite, 5,368 checks. All 8 flavour/option configurations agree with the independent double-precision reference (K/V injection, incremental injection, truncation, drafts, confidences); drafted generation is token-identical to plain decoding for greedy and seeded sampling. Real drafter weights: not measured |
+| Recurrent, hybrid and DSV4 architectures | not implemented | refused by the architecture allow-list (see the section on open items below) |
 | Grouped expert kernels and WMMA paths (gfx1201), SIMT paths (gfx1031) | implemented in `kernels/` and `src/device/hip_backend.hip` | Implemented, unverified (not compiled) |
 | HIP backend build (`KNJ_ENABLE_HIP=ON`) | implemented | Not compiled in this environment |
 | Measured CPU fallback for expert work (queue, SwiGLU rows, cancellation, cost bookkeeping) | implemented; scheduled only on GPU builds | Verified (host): direct unit checks in `model` against a double-precision reference. Routing decisions on a GPU: unverified |
@@ -50,8 +50,19 @@ from the model definition.
 
 - The synthetic model exercises the Qwen3-MoE schema only. Other architectures
   share code paths but have no reference comparison.
-- Speculation is verified for the MTP drafter. Its benefit depends on acceptance,
-  which has not been measured on real models.
+- Speculation is verified for the MTP drafter and the DFlash family on synthetic
+  fixtures. Its benefit depends on acceptance, which has not been measured on real
+  models.
+- DFlash drafter math runs on the CPU reference kernels in host memory. The
+  drafter's weights are not counted against the memory budget yet. Its K/V state
+  is host float storage, roughly `2 * layers * kv_heads * head_dim * 4` bytes per
+  position.
+- DFlash drafters borrow the target's embedding and LM head when they do not ship
+  their own, which requires the same hidden width. The `decoder_arch` compatibility
+  is checked on tensor shapes, target layer ids and vocabulary, because the pinned
+  llama graph carries no decoder-family key.
+- Requests with a drafter skip prefix reuse, like MTP requests, because the drafter
+  state is derived from per-position target features that prefix pages do not carry.
 - Session checkpoints are resumed with plain decoding. MTP-enabled requests do not
   use prefix reuse, because the drafter needs hidden states that prefix pages do
   not carry.

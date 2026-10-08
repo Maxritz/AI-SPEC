@@ -61,6 +61,16 @@ Engine::Engine(const std::string& path, Config config, int device) : config_(std
     tokenizer_ = std::make_unique<tokenizer::Tokenizer>(index_);
     require(tokenizer_->vocab_size() == spec_.vocabulary, "tokenizer and embedding vocabularies disagree");
     model_ = std::make_unique<model::Model>(index_, spec_, runtime_, *transfers_, profile_, budget_.workspace, config_.prefill_chunk, executor_.get(), residency_.get(), predictor_.get());
+    if (!config_.drafter_path.empty()) {
+        drafter_ = std::make_unique<dflash::Drafter>(gguf::load_model_index(config_.drafter_path), spec_);
+        const auto& d = drafter_->spec();
+        require((d.flavor == dflash::Flavor::DSpark) == (config_.drafter == "dspark"),
+                std::string("spec.drafter does not match the drafter file flavour ") + dflash::flavor_name(d.flavor));
+        const uint32_t trained = d.block_size - (d.flavor == dflash::Flavor::DSpark && d.sample_from_anchor ? 0u : 1u);
+        require(model_->max_batch() >= 2, "DFlash drafting needs a target batch of at least two rows");
+        drafter_max_ = std::min<uint32_t>({config_.draft_max ? config_.draft_max : config_.max_draft_width, trained, model_->max_batch() - 1});
+        require(drafter_max_ >= 1, "the drafter's trained block leaves no room for drafts");
+    }
     tuner_ = std::make_unique<Autotuner>(config_.tune_dir, backend_->caps().gcn_arch, backend_->caps().driver, platform::executable_hash(), "knj-abi-1");
     model_->tune(*tuner_, config_.wmma);
     kv::Identity identity{index_.fingerprint, backend_->caps().gcn_arch, tokenizer_->identity(), spec_.rope_identity};
@@ -92,7 +102,7 @@ std::shared_ptr<Generation> Engine::create(std::vector<int32_t> prompt, Options 
     uint32_t limit = uint32_t(std::min<uint64_t>(spec_.context, config_.max_tokens));
     uint64_t slabs = (cache_->geometry().layers + cache_->identity().layer_slab - 1) / cache_->identity().layer_slab;
     uint64_t block_bytes = slabs * cache_->bytes_per_page(), hot_blocks = cache_->hot_capacity() / block_bytes;
-    uint32_t rollback = options.speculate && spec_.mtp_layers ? cache_->identity().block_tokens : 0;
+    uint32_t rollback = options.speculate && (spec_.mtp_layers || drafter_) ? cache_->identity().block_tokens : 0;
     uint64_t admission_hot = hot_blocks * cache_->identity().block_tokens * cache_->bytes_per_token();
     if (rollback) { admission_hot = admission_hot > rollback * cache_->bytes_per_token() ? admission_hot - rollback * cache_->bytes_per_token() : 0; }
     residency::AdmissionController controller(admission_hot, warm_->capacity() - std::min(warm_->used(), warm_->capacity()), cache_->bytes_per_token(), limit, h2d_bytes_s_);
@@ -106,13 +116,16 @@ std::shared_ptr<Generation> Engine::create(std::vector<int32_t> prompt, Options 
     auto g = std::make_shared<Generation>(options, tenant);
     g->prompt = std::move(prompt); g->history = g->prompt; g->admission = admission;
     g->kv = std::make_unique<kv::Session>(*cache_, admission, admission.context_cap + rollback);
-    if (spec_.mtp_layers && options.speculate) {
+    if (spec_.mtp_layers && options.speculate && !drafter_) {
         residency::Admission head{true, residency::ContextClass::Resident, std::min(spec_.context, uint32_t(mtp_cache_->hot_capacity() / mtp_cache_->bytes_per_token())), requested};
         g->mtp_kv = std::make_unique<kv::Session>(*mtp_cache_, head, std::min(head.context_cap, options.max_new_tokens + config_.max_draft_width + mtp_cache_->identity().block_tokens));
     }
-    // Prefix pages carry no drafter state. MTP-enabled requests therefore
-    // prefill from scratch so their drafter cache is derived from real hidden rows.
-    if (config_.use_prefix_cache && !g->mtp_kv) {
+    if (drafter_ && options.speculate) {
+        g->dflash_kv = std::make_unique<dflash::Cache>(drafter_->make_cache());
+    }
+    // Prefix pages carry no drafter state. Drafter-enabled requests therefore
+    // prefill from scratch so their drafter cache is derived from real target features.
+    if (config_.use_prefix_cache && !g->mtp_kv && !g->dflash_kv) {
         auto hit = prefixes_->lookup(g->prompt, tenant);
         if (hit.tokens) {
             g->kv->attach_prefix(hit.blocks, hit.tokens); g->prefilled = hit.tokens; g->reused = hit.tokens;
@@ -124,7 +137,7 @@ std::shared_ptr<Generation> Engine::create(std::vector<int32_t> prompt, Options 
     return g;
 }
 void Engine::index_result(Generation& g, uint32_t start, const model::Result& result) {
-    if (!config_.use_prefix_cache || g.mtp_kv) { return; }
+    if (!config_.use_prefix_cache || g.mtp_kv || g.dflash_kv) { return; }
     uint32_t block = cache_->identity().block_tokens;
     for (uint32_t t = 0; t < result.rows; ++t) {
         uint32_t boundary = start + t + 1;
@@ -187,20 +200,23 @@ std::vector<int32_t> Engine::step(Generation& g) {
             // Complete immutable radix blocks are the reusable unit, so chunks
             // end on block boundaries whenever they span more than one block.
             if (count > cache_->identity().block_tokens) { count -= (start + count) % cache_->identity().block_tokens; }
-            auto result = model_->forward(*g.kv, *cache_, *attention_, {g.prompt.begin() + start, g.prompt.begin() + start + count}, false, cancelled);
+            auto result = forward_target(g, {g.prompt.begin() + start, g.prompt.begin() + start + count}, false, cancelled);
             g.prefilled += count; g.hidden.assign(result.hidden.end() - spec_.hidden, result.hidden.end()); g.logits = result.logits;
             remember(g, start, result); index_result(g, start, result); sync_mtp(g, cancelled); pressure();
             return {};
         }
         uint32_t width = 1;
-        if (g.mtp_kv) { width = std::min({speculation_.width(began, g.options.deadline_ns, config_.force_cold), model_->max_batch(), uint32_t(g.options.max_new_tokens - g.output.size())}); }
+        if (g.mtp_kv || g.dflash_kv) { width = std::min({speculation_.width(began, g.options.deadline_ns, config_.force_cold), model_->max_batch(), uint32_t(g.options.max_new_tokens - g.output.size())}); }
+        if (g.dflash_kv) { width = std::min(width, drafter_max_ + 1); }
         if (width <= 1) {
             int32_t token = g.sampler.sample(g.logits, g.history); emit(g, token);
             if (!g.done) {
                 uint32_t start = g.kv->size();
-                auto result = model_->forward(*g.kv, *cache_, *attention_, {token}, false, cancelled);
+                auto result = forward_target(g, {token}, false, cancelled);
                 g.hidden = result.hidden; g.logits = result.logits; remember(g, start, result); index_result(g, start, result);
             }
+        } else if (g.dflash_kv) {
+            speculate_dflash(g, cancelled, began, width);
         } else {
             // Same-seed coupled speculation. The root draw uses a copy of the
             // sampler, so the drafter never consumes the target's random stream.
@@ -250,11 +266,73 @@ std::vector<int32_t> Engine::step(Generation& g) {
     }
     return {g.output.begin() + before, g.output.end()};
 }
+model::Result Engine::forward_target(Generation& g, const std::vector<int32_t>& tokens, bool all, const std::function<bool()>& cancelled) {
+    const uint32_t start = g.kv->size();
+    std::vector<uint32_t> capture;
+    if (g.dflash_kv) { capture = drafter_->spec().target_layers; }
+    auto result = model_->forward(*g.kv, *cache_, *attention_, tokens, all, cancelled, capture);
+    if (g.dflash_kv) {
+        // Features are the target layer inputs in target_layers order, one row per position.
+        require(g.dflash_kv->size() == start, "DFlash drafter cache is not aligned with the target sequence");
+        const auto& d = drafter_->spec();
+        const uint32_t rows = result.rows, H = spec_.hidden;
+        std::vector<float> features(uint64_t(rows) * d.n_embd_inp);
+        for (uint32_t k = 0; k < d.target_layers.size(); ++k) {
+            auto it = result.captured.find(d.target_layers[k]);
+            require(it != result.captured.end() && it->second.size() == uint64_t(rows) * H, "target features were not captured");
+            for (uint32_t i = 0; i < rows; ++i) {
+                std::copy_n(it->second.begin() + uint64_t(i) * H, H, features.begin() + uint64_t(i) * d.n_embd_inp + uint64_t(k) * H);
+            }
+        }
+        drafter_->inject(*g.dflash_kv, rows, features.data());
+    }
+    return result;
+}
+void Engine::speculate_dflash(Generation& g, const std::function<bool()>& cancelled, uint64_t began, uint32_t width) {
+    // Same-seed coupled speculation, as in the MTP path: the root is drawn from a copy of the
+    // sampler, so the drafter never consumes the target's random stream.
+    auto preview = g.sampler;
+    std::vector<int32_t> chain{preview.sample(g.logits, g.history)};
+    const uint32_t start = g.kv->size();
+    require(g.dflash_kv->size() == start, "DFlash drafter is not aligned with the committed sequence");
+    const uint64_t draft_deadline = g.options.deadline_ns ? std::min<uint64_t>(g.options.deadline_ns, began + 20000000ull) : began + 20000000ull;
+    if (width > 1 && !tokenizer_->eog(chain.back()) && platform::now_ns() < draft_deadline) {
+        dflash::Options options;
+        options.n_max = drafter_max_;
+        options.n_min = config_.draft_min;
+        options.p_min = float(config_.draft_p_min);
+        // Cold experts make the next verification stall, so drafting stops early on low confidence (docs/05 1.3).
+        options.cold_p_min = config_.force_cold ? .25f : 0.0f;
+        auto draft = drafter_->draft(*model_, *g.dflash_kv, chain.back(), options);
+        for (uint32_t k = 0; k < draft.tokens.size() && chain.size() < width; ++k) {
+            chain.push_back(draft.tokens[k]);
+            if (tokenizer_->eog(draft.tokens[k])) { break; }
+        }
+    }
+    auto result = forward_target(g, chain, true, cancelled);
+    auto verification = spec::verify(chain, g.logits, result.logits, g.sampler, g.history, g.options.max_new_tokens - uint32_t(g.output.size()));
+    require(!verification.accepted.empty(), "coupled root did not match its own preview");
+    const uint32_t accepted = uint32_t(verification.accepted.size());
+    g.kv->truncate(start + accepted); forget_from(g, start + accepted); g.dflash_kv->truncate(start + accepted);
+    for (auto token : verification.accepted) { emit(g, token); if (g.done) { break; } }
+    g.hidden.assign(result.hidden.begin() + uint64_t(accepted - 1) * spec_.hidden, result.hidden.begin() + uint64_t(accepted) * spec_.hidden);
+    g.logits.assign(result.logits.begin() + uint64_t(accepted - 1) * spec_.vocabulary, result.logits.begin() + uint64_t(accepted) * spec_.vocabulary);
+    model::Result accepted_view = result; accepted_view.rows = accepted; index_result(g, start, accepted_view);
+    if (verification.replacement && !g.done) {
+        emit(g, *verification.replacement);
+        if (!g.done) {
+            uint32_t next_start = g.kv->size();
+            auto replacement = forward_target(g, {*verification.replacement}, false, cancelled);
+            g.hidden = replacement.hidden; g.logits = replacement.logits; index_result(g, next_start, replacement);
+        }
+    }
+    speculation_.observe(uint32_t(chain.size()), accepted, result.expert_union, double(platform::now_ns() - began) / 1000.0);
+}
 void Engine::suspend(Generation& g, const std::string& path) {
     require(g.kv && g.kv->size() && !g.hidden.empty(), "cannot checkpoint an unprefilled session");
     auto state = g.sampler.state(); state["tenant"] = g.tenant; state["prompt"] = g.prompt; state["output"] = g.output; state["text"] = g.text; state["prefilled"] = g.prefilled;
     g.kv->suspend(path, g.history, state, g.hidden);
-    g.mtp_kv.reset(); g.recent.clear();
+    g.mtp_kv.reset(); g.dflash_kv.reset(); g.recent.clear();
 }
 std::shared_ptr<Generation> Engine::resume(const std::string& path, uint32_t count, const std::string& tenant) {
     auto env = cache_->read_checkpoint(path), payload = env.at("payload");
@@ -286,6 +364,7 @@ void Engine::pressure() {
 nlohmann::json Engine::report() const {
     auto result = profile_.report();
     result["speculation"] = speculation_.report();
+    if (drafter_) { result["drafter"] = {{"flavor", dflash::flavor_name(drafter_->spec().flavor)}, {"block_size", drafter_->spec().block_size}, {"draft_max", drafter_max_}, {"target_layers", drafter_->spec().target_layers}, {"host_bytes", drafter_->host_bytes()}}; }
     if (predictor_) { auto p = predictor_->stats(); result["prediction"] = {{"predicted", p.predicted}, {"used", p.used}, {"late", p.late}, {"wasted_bytes", p.wasted_bytes}, {"hit_rate", p.hit_rate()}, {"horizon", predictor_->horizon()}}; }
     result["classification"] = config_.force_cold && store_ ? "storage-bound" : backend_->caps().is_gpu ? "native-gpu" : "host-reference";
     return result;

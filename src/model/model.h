@@ -23,7 +23,7 @@ struct Spec {
 struct Tensor { device::Buffer buffer; compute::Matrix matrix; std::vector<uint64_t> dims; };
 struct Result {
     uint32_t rows = 0; std::vector<float> hidden, logits;
-    std::map<uint32_t, std::vector<float>> captured;
+    std::map<uint32_t, std::vector<float>> captured;  // requested layer -> rows of its input (residual stream entering it)
     uint64_t expert_union = 0;
 };
 class Model {
@@ -38,6 +38,10 @@ public:
     Result forward(kv::Session&, kv::Cache&, attn::Attention&, const std::vector<int32_t>&, bool all_logits = false,
                    const std::function<bool()>& cancelled = {}, const std::vector<uint32_t>& capture_layers = {});
     std::vector<float> logits(const std::vector<float>& hidden);
+    // Token-embedding rows of the target (unscaled) and the target LM-head projection
+    // without any normalisation; used by the DFlash/DSpark drafter, which owns its own norms.
+    std::vector<float> embed_rows(const std::vector<int32_t>& tokens);
+    std::vector<float> head_rows(const std::vector<float>& hidden);
     Result mtp(kv::Session&, kv::Cache&, attn::Attention&, const std::vector<int32_t>& tokens, const std::vector<float>& target_hidden_rows, const std::function<bool()>& cancelled = {});
     void tune(Autotuner&, bool allow_wmma);
 private:

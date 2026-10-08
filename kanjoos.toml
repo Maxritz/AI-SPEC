@@ -50,5 +50,10 @@ max_tokens = 4096
 spill_wire_ms = 0.0
 [spec]
 drafter = ""
+# drafter = "dflash"   # or "dspark": a DFlash / DFlash2 / DSpark drafter GGUF, selected by file flavour
+# drafter_path = ""    # required when drafter is "dflash" or "dspark"
+# draft_max = 0        # 0 = derive from the trained block size
+# draft_min = 0        # discard drafts shorter than this
+# draft_p_min = 0.0    # confidence floor; DSpark needs a confidence head for a non-zero value
 draft_width = 4
 max_draft_width = 16

@@ -41,9 +41,10 @@ void usage(std::ostream& out) {
         << "  kanjoos generate --model FILE [--config FILE] (--prompt TEXT | --messages FILE)\n"
         << "                   [--max-tokens N] [--temperature T] [--top-p P] [--top-k K] [--min-p P]\n"
         << "                   [--repeat-penalty R] [--seed S] [--stop TEXT]... [--no-speculate]\n"
+        << "                   [--drafter FILE] [--draft-max N] [--draft-p-min P]\n"
         << "                   [--stream] [--json] [--rebuild-store]\n"
         << "  kanjoos serve    --model FILE [--config FILE] [--host HOST] [--port PORT] [--state-dir DIR]\n"
-        << "                   [--rebuild-store]\n"
+        << "                   [--rebuild-store] [--drafter FILE] [--draft-max N] [--draft-p-min P]\n"
         << "  kanjoos doctor   [--model FILE] [--config FILE]\n";
 }
 
@@ -113,11 +114,28 @@ std::vector<int32_t> prompt_tokens(const Args& a, const knj::tokenizer::Tokenize
     return tok.encode(a.get("--prompt"), true, false);
 }
 
+// --drafter names a DFlash/DFlash2/DSpark drafter GGUF. The flavour is read from the file:
+// a Markov head makes it DSpark, otherwise it is DFlash (DFlash2 is detected by its selector).
+void apply_drafter(const Args& a, knj::Config& config) {
+    if (a.values.count("--drafter")) {
+        config.drafter_path = a.get("--drafter");
+        const auto index = knj::gguf::load_model_index(config.drafter_path);
+        config.drafter = index.find_tensor_info("markov_w1.weight") ? "dspark" : "dflash";
+    }
+    if (a.values.count("--draft-max")) {
+        uint64_t n = std::stoull(a.get("--draft-max"));
+        require(n >= 1 && n <= 64, "--draft-max must be between 1 and 64");
+        config.draft_max = uint32_t(n);
+    }
+    if (a.values.count("--draft-p-min")) config.draft_p_min = std::stod(a.get("--draft-p-min"));
+}
+
 int cmd_generate(int argc, char** argv) {
     Args a = parse(argc, argv, 2, {"--stream", "--json", "--no-speculate", "--rebuild-store"});
     require(a.values.count("--model"), "generate needs --model");
     knj::Config config = load_config(a);
     config.rebuild_stale_store = config.rebuild_stale_store || a.has("--rebuild-store");
+    apply_drafter(a, config);
     knj::inference::Engine engine(a.get("--model"), config);
     auto options = options_from(a, config);
     auto prompt = prompt_tokens(a, engine.tokenizer());
@@ -153,7 +171,7 @@ int cmd_generate(int argc, char** argv) {
         std::cout << knj::inference::utf8(g->text) << "\n";
     }
     std::cerr << "kanjoos: " << g->output.size() << " tokens, finish=" << g->finish_reason << ", " << (seconds > 0 ? g->output.size() / seconds : 0.0) << " tok/s overall\n";
-    if (engine.has_mtp() && options.speculate) { std::cerr << "kanjoos: speculation " << engine.report()["speculation"].dump() << "\n"; }
+    if ((engine.has_mtp() || engine.has_drafter()) && options.speculate) { std::cerr << "kanjoos: speculation " << engine.report()["speculation"].dump() << "\n"; }
     return 0;
 }
 
@@ -165,6 +183,7 @@ int cmd_serve(int argc, char** argv) {
     require(a.values.count("--model"), "serve needs --model");
     knj::Config config = load_config(a);
     config.rebuild_stale_store = config.rebuild_stale_store || a.has("--rebuild-store");
+    apply_drafter(a, config);
     if (a.values.count("--host")) { config.host = a.get("--host"); }
     if (a.values.count("--port")) { uint64_t p = std::stoull(a.get("--port")); require(p <= UINT16_MAX, "--port out of range"); config.port = uint16_t(p); }
     config.validate();

@@ -43,7 +43,9 @@ Config Config::load(const std::string& path) {
         if (k == "server.port") { auto n = integer(); require(n && n <= UINT16_MAX, "server port out of range"); c.port = uint16_t(n); } else UINT("server.max_sessions", max_sessions) UINT("server.max_queued", max_queued)
         UINT("server.max_body_bytes", max_body_bytes) STR("server.api_key_env", api_key_env) BYTES("server.session_ttl_seconds", session_ttl_ns, 1000000000ull)
         UINT("inference.prefill_chunk", prefill_chunk) BYTES("inference.max_tokens", max_tokens, 1ull) REAL("inference.spill_wire_ms", spill_wire_ms)
-        STR("spec.drafter", drafter) UINT("spec.draft_width", draft_width) UINT("spec.max_draft_width", max_draft_width)
+        STR("spec.drafter", drafter) STR("spec.drafter_path", drafter_path) REAL("spec.draft_p_min", draft_p_min)
+        UINT("spec.draft_min", draft_min) UINT("spec.draft_max", draft_max)
+        UINT("spec.draft_width", draft_width) UINT("spec.max_draft_width", max_draft_width)
         { throw Error(ErrorCode::InvalidInput, "unknown config key " + k); }
 #undef STR
 #undef UINT
@@ -61,7 +63,10 @@ void Config::validate() const {
     require(warm_fraction > 0 && warm_fraction <= .9 && kv_fraction > 0 && kv_fraction < 1 && min_free_gib >= 0, "invalid memory fractions");
     require(profile_floor && profile_floor <= 100000 && max_sessions && max_queued && max_body_bytes <= 64u << 20 && max_tokens && max_tokens <= UINT32_MAX, "invalid request limits");
     require(draft_width && draft_width <= max_draft_width && max_draft_width <= 64, "invalid speculation width");
-    require(drafter.empty() || drafter == "mtp", "spec.drafter must be empty or \"mtp\": the resident MTP head is the implemented drafter; learned DFlash/DSpark loaders are not implemented in this build");
+    require(drafter.empty() || drafter == "mtp" || drafter == "dflash" || drafter == "dspark", "spec.drafter must be \"\", \"mtp\", \"dflash\" or \"dspark\"");
+    require((drafter == "dflash" || drafter == "dspark") == !drafter_path.empty(), "spec.drafter_path must name the DFlash/DSpark drafter GGUF exactly when spec.drafter is dflash or dspark");
+    require(std::isfinite(draft_p_min) && draft_p_min >= 0 && draft_p_min <= 1, "spec.draft_p_min must be in [0, 1]");
+    require(draft_max <= 64 && (draft_min <= (draft_max ? draft_max : 64u)), "invalid drafter draft length bounds");
     require(port > 0 && measured_h2d_gbs >= 0 && spill_wire_ms >= 0, "invalid server/transfer settings");
     require(kv_codec == "f32" || kv_codec == "f16" || kv_codec == "bf16" || kv_codec == "fp8" || kv_codec == "int8" || kv_codec == "int4", "unknown KV codec");
     require(allow_quantized_kv || (kv_codec != "fp8" && kv_codec != "int8" && kv_codec != "int4"), "quantized KV requires explicit precision-reduction opt-in");
