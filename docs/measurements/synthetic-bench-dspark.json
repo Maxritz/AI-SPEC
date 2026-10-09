@@ -1,0 +1,84 @@
+{
+  "host": {
+    "backend": "auto",
+    "cpus": 2,
+    "io_backend": "io_uring",
+    "io_native": true,
+    "is_gpu": false,
+    "kv_codec": "f16",
+    "memory_total_bytes": 4131278848,
+    "threads_note": "reference kernels run on the host CPU unless is_gpu is true"
+  },
+  "interpretation": "Synthetic fixture on the CPU reference backend. These numbers characterise this code path on this host only; they are not model-quality, acceptance or GPU results.",
+  "modes": {
+    "drafter": {
+      "decode_tokens_per_s": {
+        "max": 50.52125741505034,
+        "median": 49.765871481030345,
+        "min": 46.78352464027863
+      },
+      "ms_per_token": {
+        "p50": 20.428439,
+        "p95": 25.120249,
+        "samples": 96
+      },
+      "prefill_tokens_per_s": {
+        "max": 57.00163498145877,
+        "median": 52.88440956764642,
+        "min": 46.56338337831909
+      },
+      "runs": 3,
+      "speculation_cumulative": {
+        "acceptance": 0.4375,
+        "accepted": 7,
+        "algorithm": "same-seed-coupled-target-v1",
+        "attempted": 16,
+        "experts_per_accepted_token": 13.857142857142858,
+        "passes": 7,
+        "width": 1
+      },
+      "time_to_first_token_ms": {
+        "max": 1394.100889,
+        "median": 1230.766966
+      }
+    },
+    "plain": {
+      "decode_tokens_per_s": {
+        "max": 54.10703096096463,
+        "median": 50.13861203169912,
+        "min": 48.897816550364205
+      },
+      "ms_per_token": {
+        "p50": 19.22509,
+        "p95": 25.921944,
+        "samples": 96
+      },
+      "prefill_tokens_per_s": {
+        "max": 61.48338909329137,
+        "median": 58.72711002264654,
+        "min": 56.60943002185062
+      },
+      "runs": 3,
+      "time_to_first_token_ms": {
+        "max": 1152.973509,
+        "median": 1108.342502
+      }
+    }
+  },
+  "schema": "kanjoos.bench/1",
+  "source": {
+    "architecture": "qwen3moe",
+    "file": "bench-target.gguf",
+    "file_bytes": 53590848,
+    "fingerprint": "63eb0623c4cffc70c156dc91939f2282a38229cfefbcbe9f1ca1d8d473d1104c",
+    "model": "knj-synthetic-bench-target",
+    "synthetic_fixture": true
+  },
+  "workload": {
+    "new_tokens": 32,
+    "prompt": "deterministic token ids",
+    "prompt_tokens": 64,
+    "repeats": 3,
+    "sampling": "greedy"
+  }
+}

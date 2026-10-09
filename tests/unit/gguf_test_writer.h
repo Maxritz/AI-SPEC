@@ -36,9 +36,30 @@ inline std::string kv_f32(const std::string& k, float f) {
     std::memcpy(&b, &f, 4);
     return gstr(k) + u32le(6) + u32le(b);
 }
+inline std::string kv_bool(const std::string& k, bool v) { return gstr(k) + u32le(7) + std::string(1, char(v ? 1 : 0)); }
 inline std::string kv_arr_u32(const std::string& k, const std::vector<uint32_t>& xs) {
     std::string body = u32le(4) + u64le(xs.size());
     for (uint32_t x : xs) body += u32le(x);
+    return gstr(k) + u32le(9) + body;
+}
+
+inline std::string kv_arr_str(const std::string& k, const std::vector<std::string>& xs) {
+    std::string body = u32le(8) + u64le(xs.size());
+    for (const auto& x : xs) body += gstr(x);
+    return gstr(k) + u32le(9) + body;
+}
+inline std::string kv_arr_f32(const std::string& k, const std::vector<float>& xs) {
+    std::string body = u32le(6) + u64le(xs.size());
+    for (float f : xs) {
+        uint32_t b;
+        std::memcpy(&b, &f, 4);
+        body += u32le(b);
+    }
+    return gstr(k) + u32le(9) + body;
+}
+inline std::string kv_arr_i32(const std::string& k, const std::vector<int32_t>& xs) {
+    std::string body = u32le(5) + u64le(xs.size());
+    for (int32_t x : xs) body += u32le(uint32_t(x));
     return gstr(k) + u32le(9) + body;
 }
 

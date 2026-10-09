@@ -17,7 +17,8 @@ public:
     using std::runtime_error::runtime_error;
 };
 
-// ggml type ids handled: F32=0, F16=1, Q8_0=8, I32=26 (not dequantised), BF16=30.
+// F32/F16/BF16, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1 and all Q2_K..Q8_K.
+// Kernel-native affine groups (2/3/4/6/8 bits) use the same host/device decoder.
 // Writes `n` elements to `out`. `nbytes` must equal the packed size of n elements.
 void dequantize(uint32_t ggml_type, const uint8_t* src, size_t nbytes, uint64_t n, float* out);
 
@@ -29,5 +30,6 @@ std::vector<float> read_tensor_f32(const std::string& path, const gguf::ModelInd
 std::vector<uint8_t> read_bytes(const std::string& path, uint64_t offset, uint64_t nbytes);
 
 float half_to_float(uint16_t h);
+uint16_t float_to_half(float f);
 
 }  // namespace knj::tensor

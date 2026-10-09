@@ -1,0 +1,32 @@
+{
+  "data": {
+    "bits_per_token": 5.201690900396794,
+    "context_tokens": 512,
+    "mean_nll": 3.6055373817543606,
+    "nats_total": 1842.4296020764782,
+    "perplexity": 36.801454974886866,
+    "text_bytes": 6000,
+    "text_file": "docs/measurements/corpus-letters.txt",
+    "tokens_scored": 511
+  },
+  "host": {
+    "backend": "auto",
+    "cpus": 2,
+    "io_backend": "io_uring",
+    "io_native": true,
+    "is_gpu": false,
+    "kv_codec": "f16",
+    "memory_total_bytes": 4131278848,
+    "threads_note": "reference kernels run on the host CPU unless is_gpu is true"
+  },
+  "interpretation": "Synthetic fixture on the CPU reference backend. These numbers characterise this code path on this host only; they are not model-quality, acceptance or GPU results.",
+  "schema": "kanjoos.ppl/1",
+  "source": {
+    "architecture": "qwen3moe",
+    "file": "bench-target.gguf",
+    "file_bytes": 53590848,
+    "fingerprint": "63eb0623c4cffc70c156dc91939f2282a38229cfefbcbe9f1ca1d8d473d1104c",
+    "model": "knj-synthetic-bench-target",
+    "synthetic_fixture": true
+  }
+}

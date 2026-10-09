@@ -152,7 +152,7 @@ bool ggml_type_info(uint32_t type, GgmlTypeInfo* out) {
 
 bool Value::as_uint(uint64_t* out) const {
     if (type == ValueType::UINT8 || type == ValueType::UINT16 ||
-        type == ValueType::UINT32 || type == ValueType::UINT64) {
+        type == ValueType::UINT32 || type == ValueType::UINT64 || type == ValueType::BOOL) {
         *out = u;
         return true;
     }

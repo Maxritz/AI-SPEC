@@ -1,0 +1,8 @@
+if(KNJ_SANITIZE)
+  if(MSVC)
+    target_compile_options(knj_options INTERFACE /fsanitize=address)
+  else()
+    target_compile_options(knj_options INTERFACE $<$<COMPILE_LANGUAGE:CXX>:-fsanitize=address,undefined;-fno-omit-frame-pointer;-fno-sanitize-recover=all>)
+    target_link_options(knj_options INTERFACE -fsanitize=address,undefined)
+  endif()
+endif()
