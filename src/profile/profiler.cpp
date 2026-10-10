@@ -64,7 +64,20 @@ std::string Profiler::table() const {
         s << "     " << std::left << std::setw(19) << r["component"].get<std::string>() << std::right << std::setw(6) << r["ops"].get<uint64_t>() << std::fixed << std::setprecision(1) << std::setw(6) << r["percent_device"].get<double>() << "%" << std::setprecision(2) << std::setw(12) << r["dev_us"].get<double>() << std::setw(12) << r["idle_us"].get<double>() << std::setw(12) << r["host_us"].get<double>() << (r["below_floor"].get<bool>() ? " *" : "") << '\n';
     }
     s << "   instrumentation floor, " << j["floor"]["samples"] << " empty ops timed through the same begin/end path: " << j["floor"]["host_us"] << " us host, " << j["floor"]["device_us"] << " us device each.\n";
-    if (j.value("backend", "") == "host-reference") { s << "   CPU reference: GPU columns are unavailable (0); measured worker execution us:"; for (const auto& r : rows) s << " " << r["component"].get<std::string>() << "=" << r["worker_us"]; s << '\n'; }
+    // The reference backend produces no device events, so every op's execution
+    // time lands in worker_us. Print it per component whenever any was measured,
+    // not only when the header happens to name the backend exactly.
+    double worker_total = 0;
+    for (const auto& r : rows) worker_total += r["worker_us"].template get<double>();
+    if (worker_total > 0) {
+        s << "   execution us by component (host reference kernels, no device events):\n";
+        for (const auto& r : rows) {
+            const double us = r["worker_us"].template get<double>();
+            if (us <= 0) continue;
+            const uint64_t ops = r["ops"].get<uint64_t>();
+            s << "     " << std::left << std::setw(19) << r["component"].get<std::string>() << std::right << std::setw(10) << ops << " ops" << std::fixed << std::setprecision(1) << std::setw(14) << us << " us" << std::setw(10) << (ops ? us / double(ops) : 0.0) << " us/op\n";
+        }
+    }
     s << "  counters " << j["counters"].dump() << '\n' << "  latency  " << j["latency"].dump() << '\n'; return s.str();
 }
 std::string Profiler::csv() const {
