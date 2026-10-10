@@ -70,7 +70,7 @@ public:
         uint64_t done = 0;
         while (done < bytes) {
             const DWORD chunk = DWORD(std::min<uint64_t>(bytes - done, uint64_t(1) << 30));
-            Pending p;
+            Pending p{};  // value-initialise: OVERLAPPED::Internal/InternalHigh/hEvent must start at zero
             const uint64_t position = offset + done;
             p.overlapped.Offset = DWORD(position & 0xffffffffull);
             p.overlapped.OffsetHigh = DWORD(position >> 32);

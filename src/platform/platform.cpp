@@ -11,7 +11,9 @@
 #include <sstream>
 #include <system_error>
 #ifdef _WIN32
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <psapi.h>
 #include <io.h>
@@ -28,7 +30,9 @@ namespace fs = std::filesystem;
 namespace knj::platform {
 namespace {
 thread_local ThreadRole role = ThreadRole::General;
+#ifndef _WIN32
 std::string line(const fs::path& p) { std::ifstream f(p); std::string s; std::getline(f, s); return s; }
+#endif
 #ifdef _WIN32
 std::wstring wide(const std::string& s) { return fs::u8path(s).wstring(); }
 #endif
@@ -41,6 +45,20 @@ void assert_storage_allowed() {
 uint64_t now_ns() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+// Windows has no RLIMIT_MEMLOCK. How many pages a pinned pool may hold is
+// bounded by the process working set, whose default maximum is far smaller
+// than the host's lockable memory, so it has to be raised to cover the
+// requested region before VirtualLock can succeed.
+void raise_working_set(size_t n) {
+    SIZE_T lo = 0, hi = 0;
+    if (!GetProcessWorkingSetSize(GetCurrentProcess(), &lo, &hi)) return;
+    constexpr size_t kSlack = size_t(1) << 20;
+    if (n > std::numeric_limits<size_t>::max() - kSlack) return;
+    const size_t want = n + kSlack;
+    if (want <= size_t(hi)) return;
+    if (want > size_t(std::numeric_limits<SIZE_T>::max())) return;
+    SetProcessWorkingSetSize(GetCurrentProcess(), lo, SIZE_T(want));
 }
 MemoryInfo memory_info() {
     MemoryInfo m;
@@ -179,22 +197,36 @@ std::vector<uint8_t> read_all(const std::string& path, uint64_t max_bytes) {
     uint64_t n = fs::file_size(path); require(n <= max_bytes, "file exceeds size limit: " + path);
     std::vector<uint8_t> b(host_size(n)); read_at(path, 0, b.data(), b.size()); return b;
 }
+// VirtualLock is Windows' page-lock primitive. It needs the process working set
+// quota to cover the region, and the system-wide locked-page grant to allow it
+// at all. PinnedPool::locked() reports the outcome, so a host that grants no
+// page-locking degrades to ordinary commit memory instead of failing the
+// engine; a GPU DMA staging pool still requires the lock (src/host/pools.cpp).
+bool virtual_lock(void* p, size_t n) {
+    if (VirtualLock(p, n)) return true;
+    std::fprintf(stderr, "warning: page-locking %zu bytes failed with error %lu; the pool is not resident in RAM\n",
+                 n, (unsigned long)GetLastError());
+    return false;
+}
 Allocation allocate(size_t n, size_t alignment, bool locked, bool huge) {
     require(n != 0 && alignment >= sizeof(void*) && (alignment & (alignment - 1)) == 0, "invalid allocation");
-    if (locked && n > memory_info().lock_limit) throw Error(ErrorCode::ResourceExhausted, "pinned pool exceeds OS page-lock limit; raise RLIMIT_MEMLOCK/working-set quota");
     Allocation a; a.bytes = n;
 #ifdef _WIN32
+    if (locked) raise_working_set(n);
     void* p = _aligned_malloc(n, alignment); if (!p) throw std::bad_alloc();
-    if (locked && !VirtualLock(p, n)) { _aligned_free(p); throw Error(ErrorCode::ResourceExhausted, "VirtualLock failed for bounded pinned pool"); }
-    a.owner = std::shared_ptr<void>(p, [n, locked](void* ptr) { if (locked) VirtualUnlock(ptr, n); _aligned_free(ptr); });
+    bool pinned = locked && virtual_lock(p, n);
+    a.owner = std::shared_ptr<void>(p, [n, pinned](void* ptr) { if (pinned) VirtualUnlock(ptr, n); _aligned_free(ptr); });
+    a.locked = pinned;
     (void)huge;
 #else
     void* p = nullptr; if (posix_memalign(&p, alignment, n) != 0) throw std::bad_alloc();
     if (huge) madvise(p, n, MADV_HUGEPAGE);
     if (locked && mlock(p, n) != 0) { std::free(p); throw Error(ErrorCode::ResourceExhausted, "mlock failed for bounded pinned pool"); }
     a.owner = std::shared_ptr<void>(p, [n, locked](void* ptr) { if (locked) munlock(ptr, n); std::free(ptr); });
+    a.locked = locked;
 #endif
-    a.data = a.owner.get(); a.locked = locked; return a;
+    a.data = a.owner.get();
+    return a;
 }
 void prefetch_file(const std::string& p, uint64_t off, uint64_t bytes) {
 #ifndef _WIN32

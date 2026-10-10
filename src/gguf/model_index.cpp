@@ -178,10 +178,11 @@ ModelIndex load_model_index(const std::string& path) {
         }
         const uint64_t total = kv_u32(g, "general.split_tensors_count", uint32_t(g.tensors.size()));
         if (total != g.tensors.size()) throw ParseError("corrupted model: " + std::to_string(total) + " tensors expected but " + std::to_string(g.tensors.size()) + " found across splits");
-        idx.tensors = g.tensors;
         // The composite fingerprint covers every split's header and size.
         idx.fingerprint = hash_text(composite);
     }
+    // The merged directory is the index: the main file's tensors plus any split's.
+    idx.tensors = g.tensors;
 
     // Classify tensors: stacked expert tensors vs. resident trunk.
     struct Pending { ExpertLayer layer; bool present[3] = {false, false, false}; };
