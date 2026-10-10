@@ -228,4 +228,82 @@ void attention(const AttentionPlan& original) {
     for (uint32_t page = 0; page < p.block_count; ++page) attention_page({p, page, (p.pool ? p.pool + p.block_offsets[page] : reinterpret_cast<const uint8_t*>(p.block_offsets[page])), false});
     attention_finish(p);
 }
+// Gated DeltaNet reference kernels. These follow llama.cpp's autoregressive delta-net exactly:
+// the state is decayed by exp(g) first, the delta is computed against the decayed state, then the
+// outer product k * delta is added and the output reads the updated state with the scaled query.
+namespace {
+inline float silu_value(float x) { return x / (1.0f + std::exp(-x)); }
+inline float sigmoid_value(float x) { return 1.0f / (1.0f + std::exp(-x)); }
+inline float softplus_value(float x) { return x > 20.0f ? x : std::log1p(std::exp(x)); }
+}  // namespace
+void conv(const ConvPlan& p) {
+    require(p.input && p.state && p.weight && p.output && p.tokens && p.channels && p.kernel > 1, "invalid causal convolution plan");
+    const uint32_t history = p.kernel - 1;
+    // Extended input: history rows (oldest first) followed by the token rows of this call.
+    auto row = [&](uint32_t r) -> const float* { return r < history ? p.state + uint64_t(r) * p.channels : p.input + uint64_t(r - history) * p.channels; };
+    for (uint32_t t = 0; t < p.tokens; ++t) for (uint32_t c = 0; c < p.channels; ++c) {
+        float sum = 0;
+        for (uint32_t j = 0; j < p.kernel; ++j) sum += p.weight[uint64_t(c) * p.kernel + j] * row(t + j)[c];
+        p.output[uint64_t(t) * p.channels + c] = silu_value(sum);
+    }
+    std::vector<float> next(uint64_t(history) * p.channels);
+    for (uint32_t r = 0; r < history; ++r) for (uint32_t c = 0; c < p.channels; ++c) next[uint64_t(r) * p.channels + c] = row(p.tokens + r)[c];
+    std::copy(next.begin(), next.end(), p.state);
+}
+void gdn_scan(const GdnScanPlan& p) {
+    require(p.qkv && p.beta && p.alpha && p.dt_bias && p.a && p.state && p.output && p.tokens && p.key_heads && p.value_heads && p.head,
+            "invalid gated delta-net plan");
+    require(p.value_heads % p.key_heads == 0, "value heads must be a multiple of key heads");
+    require(!p.grouped || p.group * p.key_heads == p.value_heads, "grouped beta/alpha layout disagrees with head counts");
+    const uint32_t D = p.head, ratio = p.value_heads / p.key_heads;
+    const uint64_t key_width = uint64_t(p.key_heads) * D, value_width = uint64_t(p.value_heads) * D, conv_width = 2 * key_width + value_width;
+    const float scale = 1.0f / std::sqrt(float(D));
+    std::vector<float> q(key_width), k(key_width);
+    for (uint32_t t = 0; t < p.tokens; ++t) {
+        const float* x = p.qkv + uint64_t(t) * conv_width;
+        for (uint32_t kh = 0; kh < p.key_heads; ++kh) {
+            float sq = 0, sk = 0;
+            for (uint32_t d = 0; d < D; ++d) { sq += x[kh * D + d] * x[kh * D + d]; sk += x[key_width + kh * D + d] * x[key_width + kh * D + d]; }
+            const float rq = 1.0f / std::sqrt(sq + p.epsilon), rk = 1.0f / std::sqrt(sk + p.epsilon);
+            for (uint32_t d = 0; d < D; ++d) { q[kh * D + d] = x[kh * D + d] * rq; k[kh * D + d] = x[key_width + kh * D + d] * rk; }
+        }
+        for (uint32_t h = 0; h < p.value_heads; ++h) {
+            const uint32_t kh = h / ratio;
+            const uint64_t bi = p.grouped ? uint64_t(h / p.group) * 2 * p.group + h % p.group : uint64_t(h);
+            const uint64_t ai = p.grouped ? uint64_t(h / p.group) * 2 * p.group + p.group + h % p.group : uint64_t(h);
+            const float beta = sigmoid_value(p.beta[t * p.beta_stride + bi]);
+            const float g = p.a[h] * softplus_value(p.alpha[t * p.alpha_stride + ai] + p.dt_bias[h]);
+            const float decay = std::exp(g);
+            float* S = p.state + uint64_t(h) * D * D;
+            const float* v = x + 2 * key_width + uint64_t(h) * D;
+            for (uint64_t e = 0; e < uint64_t(D) * D; ++e) S[e] *= decay;
+            std::vector<float> delta(D);
+            for (uint32_t j = 0; j < D; ++j) {
+                float kv = 0;
+                for (uint32_t i = 0; i < D; ++i) kv += S[uint64_t(i) * D + j] * k[kh * D + i];
+                delta[j] = (v[j] - kv) * beta;
+            }
+            for (uint32_t i = 0; i < D; ++i) for (uint32_t j = 0; j < D; ++j) S[uint64_t(i) * D + j] += k[kh * D + i] * delta[j];
+            float* out = p.output + uint64_t(t) * value_width + uint64_t(h) * D;
+            for (uint32_t j = 0; j < D; ++j) {
+                float o = 0;
+                for (uint32_t i = 0; i < D; ++i) o += S[uint64_t(i) * D + j] * q[kh * D + i] * scale;
+                out[j] = o;
+            }
+        }
+    }
+}
+void gated_norm(const GatedNormPlan& p) {
+    require(p.input && p.gate && p.weight && p.output && p.rows && p.width && p.epsilon > 0, "invalid gated normalization plan");
+    for (uint32_t r = 0; r < p.rows; ++r) {
+        const float* x = p.input + uint64_t(r) * p.width; const float* z = p.gate + uint64_t(r) * p.width; float* y = p.output + uint64_t(r) * p.width;
+        float sum = 0; for (uint32_t j = 0; j < p.width; ++j) sum += x[j] * x[j];
+        const float inv = 1.0f / std::sqrt(sum / float(p.width) + p.epsilon);
+        for (uint32_t j = 0; j < p.width; ++j) y[j] = x[j] * inv * p.weight[j] * silu_value(z[j]);
+    }
+}
+void sigmoid_gate(const SigmoidGatePlan& p) {
+    require(p.value && p.gate && p.elements, "invalid sigmoid gate plan");
+    for (uint64_t i = 0; i < p.elements; ++i) p.value[i] *= sigmoid_value(p.gate[i]);
+}
 }  // namespace knj::compute

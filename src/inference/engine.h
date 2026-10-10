@@ -20,6 +20,10 @@ struct Options {
 struct Generation {
     Options options; Sampler sampler; std::atomic<bool> cancelled{false}; std::string tenant;
     std::unique_ptr<kv::Session> kv, mtp_kv; std::unique_ptr<dflash::Cache> dflash_kv; std::vector<int32_t> prompt, history, output;
+    // Per-session Gated DeltaNet state (conv histories and delta-rule states). Empty for
+    // pure-attention models; prefix reuse is disabled for recurrent models because the
+    // recurrent state cannot be rebuilt from KV pages (docs/02 C12 replay-suffix rule).
+    model::RecurrentState recurrent;
     // Target hidden state of every recently committed position (position -> row).
     // The MTP drafter's cache is always re-derived from these canonical rows.
     std::map<uint32_t, std::vector<float>> recent;

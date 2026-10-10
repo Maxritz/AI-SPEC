@@ -31,11 +31,13 @@ from the model definition.
 | Tokenizer and chat templates (pinned llama.cpp vocabulary-only loader plus `common/jinja`) | implemented | Verified (host) on a synthetic SPM vocabulary. Real vocabularies: not tested |
 | Qwen3-MoE forward (per-head Q/K norms, NEOX RoPE, GQA, softmax top-k routing, SwiGLU experts, LM head) | implemented | Verified (host): logits within 2e-4 of the independent reference; greedy output identical |
 | MTP (nextn) speculation with same-seed coupled verification | implemented | Verified (host): identical tokens to plain decoding for greedy and seeded sampling; acceptance on real models not measured |
-| MoE and dense families `qwen2` (dense, Q/K/V biases), `qwen2moe`, `olmoe` (full-width Q/K norm), `minimax-m2` (full-width Q/K norm, partial NEOX RoPE, sigmoid routing with bias), `glm4moe` (Q/K/V biases, partial RoPE, sigmoid group routing, shared expert, dense lead block, NextN) | implemented | Verified (host): `test_model` family suite, 720 checks in total. Logits within 2e-4 of the double-precision reference; greedy, scoring, expert eviction, prefix reuse, checkpoint and (GLM) MTP identity on synthetic random-weight fixtures. Real weights not tested. See `docs/11-model-families.md` |
+| MoE and dense families `qwen2` (dense, Q/K/V biases), `qwen2moe`, `olmoe` (full-width Q/K norm), `minimax-m2` (full-width Q/K norm, partial NEOX RoPE, sigmoid routing with bias), `glm4moe` (Q/K/V biases, partial RoPE, sigmoid group routing, shared expert, dense lead block, NextN) | implemented | Verified (host): `test_model` family suite. Logits within 2e-4 of the double-precision reference; greedy, scoring, expert eviction, prefix reuse, checkpoint and (GLM) MTP identity on synthetic random-weight fixtures. Real weights not tested. See `docs/11-model-families.md` |
+| Hybrid Gated DeltaNet families `qwen35` (dense), `qwen35moe`, `qwen3next` (covers Ornith 1.0/1.5): per-layer recurrent flags (`attention.recurrent_layers` array or `full_attention_interval`), causal conv1d state, delta-rule recurrence with L2-normalised Q/K, split (`ssm_beta`/`ssm_alpha`) and grouped (`ssm_ba`) beta/alpha layouts, gated-Q attention (sigmoid output gate), gated RMS norm, compact KV cache (one slot per full-attention layer), per-session recurrent state with snapshot/restore/replay rollback for speculation, `.rstate` sidecar on suspend/resume, prefix reuse disabled | implemented | Verified (host): `test_model` family suite (9 families, 2,732 checks in total) plus op-level conv/gdn_scan/gated_norm/sigmoid_gate checks against scalar loops; hybrid+MTP speculation is token-identical to plain decoding; checkpoint resume exact. Real weights not tested. See `docs/11-model-families.md` |
+| Quantization decoder for all 15 standard ggml types (F32/F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K) and the GGUF row-alignment rule | implemented | Verified (host): `test_model` re-encodes three families (MoE, GDN-MoE split, GDN-MoE grouped) in every type and checks engine logits against the double-precision reference on the dequantized weights; `quant_test.h` pins every decoder with hand-computed known-answer blocks plus round-trip drift checks. Two decoder/loader bugs found and fixed by these tests: the Q5_0/Q5_1 5th-bit index and the missing row-alignment refusal |
 | Dense llama and qwen3 forward paths, DeepSeek2 (MLA with unequal K/V widths) | implemented | Implemented, unverified: not in the family suite; no MLA reference |
 | Sliding-window attention layers | implemented | Implemented, unverified |
 | Speculation with DFlash / DFlash2 / DSpark drafters (one loader, arch `dflash`; Markov and confidence heads; selector lattice and dynamic conv; `d2t`; sinks, sliding windows, post norms, value/logit scales) | implemented | Verified (host): `drafter` suite, 5,370 checks. All 8 flavour/option configurations agree with the independent double-precision reference (K/V injection, incremental injection, truncation, drafts, confidences); drafted generation is token-identical to plain decoding for greedy and seeded sampling. Real drafter weights: not measured |
-| Recurrent and hybrid architectures (`qwen3next`, `qwen35`, `qwen35moe`, `qwen4exp`) and DSV4 (`deepseek4`) | not implemented | refused by the architecture allow-list; status and plan per family in `docs/11-model-families.md` |
+| Recurrent and hybrid architectures not yet in the family suite (`qwen4exp`) and DSV4 (`deepseek4`) | not implemented | refused by the architecture allow-list; status and plan per family in `docs/11-model-families.md` |
 | Grouped expert kernels and WMMA paths (gfx1201), SIMT paths (gfx1031) | implemented in `kernels/` and `src/device/hip_backend.hip` | Implemented, unverified (not compiled) |
 | HIP backend build (`KNJ_ENABLE_HIP=ON`) | implemented | Not compiled in this environment |
 | Measured CPU fallback for expert work (queue, SwiGLU rows, cancellation, cost bookkeeping) | implemented; scheduled only on GPU builds | Verified (host): direct unit checks in `model` against a double-precision reference. Routing decisions on a GPU: unverified |
@@ -85,14 +87,17 @@ from the model definition.
 These are not implemented in this tree. The architecture allow-list refuses them with
 `Unsupported`, so nothing runs with a guessed forward pass.
 
-- **Recurrent (gated-delta-net) and hybrid attention/recurrent stacks, Qwen3.8-Flash-Next
-  (`qwen4exp`), and DSV4 (`deepseek4`).** Each needs a new tensor schema, a reference
-  implementation for the synthetic fixture, and runtime support. Recurrent layers need a
-  separate state array with its own budget (`docs/02-components.md`, C14), and hybrid
-  prefixes need replay-suffix rollback instead of prefix reuse (C12). Qwen3.8-Flash-Next
-  adds Qwen Sparse Attention, a gated residual and hash n-gram embeddings. DSV4 adds
-  hyper-connections, sinkhorn routing, compressed attention and FP4 experts. See
-  `docs/11-model-families.md` for the per-family list.
+- **Qwen3.8-Flash-Next (`qwen4exp`) and DSV4 (`deepseek4`).** Each needs a new tensor
+  schema, a reference implementation for the synthetic fixture, and runtime support.
+  The Gated DeltaNet hybrid substrate they build on (`qwen3next`/`qwen35`/`qwen35moe`) is
+  implemented and verified. Qwen3.8-Flash-Next adds Qwen Sparse Attention, a gated
+  residual and hash n-gram embeddings. DSV4 adds hyper-connections, sinkhorn routing,
+  compressed attention and FP4 experts. See `docs/11-model-families.md` for the
+  per-family list.
+- **Laguna (including sharded GGUF files), `openai-moe` (gpt-oss: learned sinks,
+  clamped SwiGLU), `llama4` (iRoPE), `gemma` family, `mixtral`, `dots1`,
+  `ernie4_5-moe`, `hunyuan-moe`, `granitemoe` and newer releases.** Sharded-model loading
+  (multi-file GGUF splits) is not implemented for any family.
 - **Other MoE families.** The pinned llama.cpp registers more MoE architectures than the
   six verified profiles. The ones not yet implemented (`openai-moe`, `llama4`, `mixtral`,
   `dots1`, `ernie4_5-moe`, `hunyuan-moe`, `granitemoe`, and newer releases) are listed in

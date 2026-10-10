@@ -48,7 +48,7 @@ bool load_matrix(const gguf::ModelIndex& idx, const std::string& name, uint64_t 
     if (!info) return false;
     require(info->dims.size() == 2 && info->dims[0] == cols && info->dims[1] == rows,
             "drafter tensor " + name + " has an unexpected shape");
-    w.bytes = tensor::read_bytes(idx.path, info->abs_offset, info->nbytes);
+    w.bytes = tensor::read_bytes(info->payload_path(idx.path), info->abs_offset, info->nbytes);
     w.m = compute::Matrix{w.bytes.data(), uint32_t(rows), uint32_t(cols), info->type};
     compute::validate(w.m);
     w.present = true;
@@ -492,7 +492,7 @@ Drafter::Drafter(const gguf::ModelIndex& idx, const model::Spec& target) : impl_
         const auto* info = idx.find_tensor_info("d2t");
         require(info->type == 27 && info->dims.size() == 1 && info->nelements > 0, "d2t must be an I64 vector");
         s.draft_vocabulary = uint32_t(info->nelements);
-        auto raw = tensor::read_bytes(idx.path, info->abs_offset, info->nbytes);
+        auto raw = tensor::read_bytes(info->payload_path(idx.path), info->abs_offset, info->nbytes);
         require(raw.size() == info->nelements * sizeof(int64_t), "d2t payload size mismatch");
         m.d2t.resize(info->nelements);
         std::memcpy(m.d2t.data(), raw.data(), raw.size());

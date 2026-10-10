@@ -35,7 +35,8 @@ std::vector<float> read_tensor_f32(const std::string& path, const gguf::ModelInd
             throw std::runtime_error("tensor " + name + " has " + std::to_string(t.nelements) +
                                      " elements, expected " + std::to_string(expected_elements));
         }
-        std::vector<uint8_t> raw = read_bytes(path, t.abs_offset, t.nbytes);
+        // Sharded models: the payload lives in the split file that lists the tensor.
+        std::vector<uint8_t> raw = read_bytes(t.payload_path(path), t.abs_offset, t.nbytes);
         std::vector<float> out(static_cast<size_t>(t.nelements));
         dequantize(t.type, raw.data(), raw.size(), t.nelements, out.data());
         return out;

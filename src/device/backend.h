@@ -60,5 +60,9 @@ public:
     virtual void attention_init(const compute::AttentionPlan&, StreamId) = 0;
     virtual void attention_page(const compute::AttentionPagePlan&, StreamId) = 0;
     virtual void attention_finish(const compute::AttentionPlan&, StreamId) = 0;
+    virtual void conv(const compute::ConvPlan&, StreamId) = 0;
+    virtual void gdn_scan(const compute::GdnScanPlan&, StreamId) = 0;
+    virtual void gated_norm(const compute::GatedNormPlan&, StreamId) = 0;
+    virtual void sigmoid_gate(const compute::SigmoidGatePlan&, StreamId) = 0;
 };
 }  // namespace knj::device

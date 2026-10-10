@@ -66,6 +66,7 @@ public:
     KNJ_CPU_OP(expert, ExpertPlan) KNJ_CPU_OP(accumulate, AccumulatePlan) KNJ_CPU_OP(kv_write, KvWritePlan)
     KNJ_CPU_OP(attention, AttentionPlan) KNJ_CPU_OP(attention_init, AttentionPlan)
     KNJ_CPU_OP(attention_page, AttentionPagePlan) KNJ_CPU_OP(attention_finish, AttentionPlan)
+    KNJ_CPU_OP(conv, ConvPlan) KNJ_CPU_OP(gdn_scan, GdnScanPlan) KNJ_CPU_OP(gated_norm, GatedNormPlan) KNJ_CPU_OP(sigmoid_gate, SigmoidGatePlan)
 #undef KNJ_CPU_OP
 };
 }

@@ -1,5 +1,6 @@
 #include "dispatch.h"
 #include "device/weight_decode.h"
+#include "core/error.h"
 #include <cmath>
 #include <hip/hip_fp16.h>
 namespace knj::kernels {
@@ -102,6 +103,73 @@ __global__ void rearrange_kernel(RearrangePlan p) {
     uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; if (i >= uint64_t(p.tokens) * p.heads * p.width) return; uint32_t d = uint32_t(i % p.width), h = uint32_t(i / p.width % p.heads), t = uint32_t(i / (uint64_t(p.width) * p.heads));
     p.target[uint64_t(t) * p.dst_token_stride + uint64_t(h) * p.dst_head_stride + p.dst_offset + d] = p.source[uint64_t(t) * p.src_token_stride + uint64_t(h) * p.src_head_stride + p.src_offset + d];
 }
+// Gated DeltaNet device kernels. The scan runs one block per value head with one thread per state
+// column j (block size == head dimension, a power of two up to 256). Each thread owns S[:, j].
+__device__ inline float gdn_silu(float x) { return x / (1.0f + expf(-x)); }
+__device__ inline float block_sum(float v, float* red, uint32_t j, uint32_t width) {
+    red[j] = v; __syncthreads();
+    for (uint32_t s = width / 2; s > 0; s >>= 1) { if (j < s) red[j] += red[j + s]; __syncthreads(); }
+    float total = red[0]; __syncthreads(); return total;
+}
+__global__ void conv_kernel(ConvPlan p) {
+    uint32_t c = blockIdx.x * blockDim.x + threadIdx.x; if (c >= p.channels) return;
+    const uint32_t history = p.kernel - 1;
+    for (uint32_t t = 0; t < p.tokens; ++t) {
+        float sum = 0;
+        for (uint32_t j = 0; j < p.kernel; ++j) {
+            uint32_t r = t + j; float x = r < history ? p.state[uint64_t(r) * p.channels + c] : p.input[uint64_t(r - history) * p.channels + c];
+            sum += p.weight[uint64_t(c) * p.kernel + j] * x;
+        }
+        p.output[uint64_t(t) * p.channels + c] = gdn_silu(sum);
+    }
+    // Rewrite the history with the last `history` rows of the extended input. Reads run ahead of writes, so ascending order is safe.
+    for (uint32_t r = 0; r < history; ++r) {
+        uint32_t src = p.tokens + r; float x = src < history ? p.state[uint64_t(src) * p.channels + c] : p.input[uint64_t(src - history) * p.channels + c];
+        p.state[uint64_t(r) * p.channels + c] = x;
+    }
+}
+__global__ void gdn_scan_kernel(GdnScanPlan p) {
+    __shared__ float qs[256], ks[256], red[256], coef[2];
+    const uint32_t h = blockIdx.x, j = threadIdx.x, D = p.head;
+    const uint32_t kh = h / (p.value_heads / p.key_heads);
+    const uint64_t key_width = uint64_t(p.key_heads) * D, value_width = uint64_t(p.value_heads) * D, conv_width = 2 * key_width + value_width;
+    const float scale = rsqrtf(float(D));
+    float* S = p.state + uint64_t(h) * D * D;
+    for (uint32_t t = 0; t < p.tokens; ++t) {
+        const float* x = p.qkv + uint64_t(t) * conv_width;
+        float qv = x[kh * D + j], kv = x[key_width + kh * D + j];
+        float sq = block_sum(qv * qv, red, j, D), sk = block_sum(kv * kv, red, j, D);
+        qs[j] = qv * rsqrtf(sq + p.epsilon); ks[j] = kv * rsqrtf(sk + p.epsilon);
+        if (j == 0) {
+            const uint64_t bi = p.grouped ? uint64_t(h / p.group) * 2 * p.group + h % p.group : uint64_t(h);
+            const uint64_t ai = p.grouped ? uint64_t(h / p.group) * 2 * p.group + p.group + h % p.group : uint64_t(h);
+            float braw = p.beta[t * p.beta_stride + bi], araw = p.alpha[t * p.alpha_stride + ai] + p.dt_bias[h];
+            float softplus = araw > 20.0f ? araw : log1pf(expf(araw));
+            coef[0] = expf(p.a[h] * softplus); coef[1] = 1.0f / (1.0f + expf(-braw));
+        }
+        __syncthreads();
+        const float decay = coef[0], beta = coef[1];
+        float kvj = 0;
+        for (uint32_t i = 0; i < D; ++i) { float s = S[uint64_t(i) * D + j] * decay; S[uint64_t(i) * D + j] = s; kvj += s * ks[i]; }
+        float delta = (x[2 * key_width + uint64_t(h) * D + j] - kvj) * beta;
+        float o = 0;
+        for (uint32_t i = 0; i < D; ++i) { float s = S[uint64_t(i) * D + j] + ks[i] * delta; S[uint64_t(i) * D + j] = s; o += s * qs[i]; }
+        p.output[uint64_t(t) * value_width + uint64_t(h) * D + j] = o * scale;
+        __syncthreads();
+    }
+}
+__global__ void gated_norm_kernel(GatedNormPlan p) {
+    __shared__ float red[256];
+    uint32_t r = blockIdx.x, j = threadIdx.x;
+    float x = p.input[uint64_t(r) * p.width + j];
+    float total = block_sum(x * x, red, j, p.width);
+    float inv = rsqrtf(total / float(p.width) + p.epsilon);
+    p.output[uint64_t(r) * p.width + j] = x * inv * p.weight[j] * gdn_silu(p.gate[uint64_t(r) * p.width + j]);
+}
+__global__ void sigmoid_gate_kernel(SigmoidGatePlan p) {
+    uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; if (i >= p.elements) return;
+    p.value[i] *= 1.0f / (1.0f + expf(-p.gate[i]));
+}
 __global__ void router_kernel(RouterPlan p) {
     uint32_t t = blockIdx.x; if (threadIdx.x) return;
     float gate[1024], scores[1024], gs[64]; bool allowed[64]; const float* x = p.logits + uint64_t(t) * p.experts; float mx = -INFINITY; double sum = 0;
@@ -186,6 +254,19 @@ void norm(const NormPlan& p, hipStream_t s) { hipLaunchKernelGGL(norm_kernel, di
 void activation(const ActivationPlan& p, hipStream_t s) { hipLaunchKernelGGL(act_kernel, dim3(grid(p.elements)), dim3(threads), 0, s, p); }
 void add(const AddPlan& p, hipStream_t s) { hipLaunchKernelGGL(add_kernel, dim3(grid(p.elements)), dim3(threads), 0, s, p); }
 void embed(const EmbedPlan& p, hipStream_t s) { hipLaunchKernelGGL(embed_kernel, dim3(grid(uint64_t(p.count) * p.weight.cols)), dim3(threads), 0, s, p); }
+void conv(const ConvPlan& p, hipStream_t s) {
+    require(p.kernel > 1 && p.kernel <= 16 && p.channels && p.tokens, "invalid causal convolution launch");
+    hipLaunchKernelGGL(conv_kernel, dim3(grid(p.channels)), dim3(threads), 0, s, p);
+}
+void gdn_scan(const GdnScanPlan& p, hipStream_t s) {
+    require(p.head && p.head <= 256 && (p.head & (p.head - 1)) == 0 && p.value_heads % p.key_heads == 0, "gated delta-net scan requires a power-of-two head size up to 256");
+    hipLaunchKernelGGL(gdn_scan_kernel, dim3(p.value_heads), dim3(p.head), 0, s, p);
+}
+void gated_norm(const GatedNormPlan& p, hipStream_t s) {
+    require(p.width && p.width <= 256 && (p.width & (p.width - 1)) == 0, "gated normalization requires a power-of-two width up to 256");
+    hipLaunchKernelGGL(gated_norm_kernel, dim3(p.rows), dim3(p.width), 0, s, p);
+}
+void sigmoid_gate(const SigmoidGatePlan& p, hipStream_t s) { hipLaunchKernelGGL(sigmoid_gate_kernel, dim3(grid(p.elements)), dim3(threads), 0, s, p); }
 void rearrange(const RearrangePlan& p, hipStream_t s) { hipLaunchKernelGGL(rearrange_kernel, dim3(grid(uint64_t(p.tokens) * p.heads * p.width)), dim3(threads), 0, s, p); }
 void rope(const RopePlan& p, hipStream_t s) { hipLaunchKernelGGL(rope_kernel, dim3(grid(uint64_t(p.tokens) * p.heads * p.rope_dim / 2)), dim3(threads), 0, s, p); }
 void router(const RouterPlan& p, hipStream_t s) { hipLaunchKernelGGL(router_kernel, dim3(p.tokens), dim3(32), 0, s, p); }

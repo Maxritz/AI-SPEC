@@ -42,6 +42,11 @@ inline std::string kv_arr_u32(const std::string& k, const std::vector<uint32_t>&
     for (uint32_t x : xs) body += u32le(x);
     return gstr(k) + u32le(9) + body;
 }
+inline std::string kv_arr_bool(const std::string& k, const std::vector<uint8_t>& xs) {
+    std::string body = u32le(7) + u64le(xs.size());
+    for (uint8_t x : xs) body += char(x ? 1 : 0);
+    return gstr(k) + u32le(9) + body;
+}
 
 inline std::string kv_arr_str(const std::string& k, const std::vector<std::string>& xs) {
     std::string body = u32le(8) + u64le(xs.size());

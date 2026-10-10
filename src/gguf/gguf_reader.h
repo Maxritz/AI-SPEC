@@ -51,6 +51,11 @@ struct TensorInfo {
     uint64_t abs_offset = 0;      // absolute file offset of the tensor payload
     uint64_t nelements = 0;
     uint64_t nbytes = 0;          // payload size on disk
+    // Sharded models: the split file holding this tensor's payload (empty for the
+    // main file). Set by load_model_index when general.split_count > 1.
+    std::string file;
+    // Path of the file holding the payload: the tensor's own split, else the main file.
+    std::string payload_path(const std::string& main_path) const { return file.empty() ? main_path : file; }
 };
 
 struct GgufFile {
@@ -65,6 +70,8 @@ struct GgufFile {
     std::string fingerprint;
     std::vector<std::pair<std::string, Value>> kv;  // file order
     std::vector<TensorInfo> tensors;                // file order
+    // Sharded models: every split path, main (split 0) first. Empty for single-file models.
+    std::vector<std::string> split_paths;
 
     const Value* find_kv(const std::string& key) const;
     const TensorInfo* find_tensor(const std::string& name) const;

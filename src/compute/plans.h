@@ -57,4 +57,30 @@ void attention(const AttentionPlan&);
 void attention_init(const AttentionPlan&);
 void attention_page(const AttentionPagePlan&);
 void attention_finish(const AttentionPlan&);
+// Gated DeltaNet (linear attention) plans. Layouts are row-major f32 per token.
+// ConvPlan: depthwise causal convolution over channels with a (kernel-1)-row history
+//   (oldest row first) that is read and rewritten in place; the output has SiLU applied.
+//   weight[c * kernel + j] is tap j of channel c (GGUF ssm_conv1d dims [kernel, channels]).
+struct ConvPlan { const float* input = nullptr; float* state = nullptr; const float* weight = nullptr; float* output = nullptr; uint32_t tokens = 0, channels = 0, kernel = 0; };
+// GdnScanPlan: per token, L2-normalises the query and key heads, applies the decay/delta rule
+//   to the per-value-head state S[key][value] and reads o = S^T (q / sqrt(head)).
+//   qkv holds [q (key_heads*head) | k (key_heads*head) | v (value_heads*head)] per token.
+//   beta/alpha are raw projections. In the split layout (Qwen3.5) beta[t*beta_stride + h] and
+//   alpha[t*alpha_stride + h]. In the grouped layout (Qwen3-Next ssm_beta_alpha) both point at the
+//   same buffer with stride 2*value_heads and head h reads group h/group at (h/group)*2*group + h%group
+//   (beta) and ... + group (alpha).
+struct GdnScanPlan {
+    const float* qkv = nullptr; const float* beta = nullptr; const float* alpha = nullptr;
+    uint64_t beta_stride = 0, alpha_stride = 0; bool grouped = false; uint32_t group = 1;
+    const float* dt_bias = nullptr; const float* a = nullptr; float* state = nullptr; float* output = nullptr;
+    uint32_t tokens = 0, key_heads = 0, value_heads = 0, head = 0; float epsilon = 1e-6f;
+};
+// GatedNormPlan: out[r][j] = input[r][j] / sqrt(mean(input[r]^2) + eps) * weight[j] * SiLU(gate[r][j]).
+struct GatedNormPlan { const float* input = nullptr; const float* gate = nullptr; const float* weight = nullptr; float* output = nullptr; uint32_t rows = 0, width = 0; float epsilon = 1e-6f; };
+// SigmoidGatePlan: value[i] *= sigmoid(gate[i]) (attention output gating in Qwen3.5 / Qwen3-Next).
+struct SigmoidGatePlan { float* value = nullptr; const float* gate = nullptr; uint64_t elements = 0; };
+void conv(const ConvPlan&);
+void gdn_scan(const GdnScanPlan&);
+void gated_norm(const GatedNormPlan&);
+void sigmoid_gate(const SigmoidGatePlan&);
 }  // namespace knj::compute

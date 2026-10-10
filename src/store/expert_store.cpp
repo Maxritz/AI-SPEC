@@ -550,11 +550,17 @@ struct ExpertStore::Impl {
             gguf::ByteSpan sp = idx.coalesced_extent(layer, ExpertKind(k), first, count);
             sizes[k] = sp.nbytes / count;
             src[k].resize(sp.nbytes);
-            if (platform::seek_file(f, sp.abs_offset) != 0 ||
-                std::fread(&src[k][0], 1, src[k].size(), f) != src[k].size()) {
+            // Sharded models: each coalesced extent lives in the split file that lists it.
+            const std::string span_file = sp.payload_path(source_path);
+            FILE* sf = std::fopen(span_file.c_str(), "rb");
+            if (!sf) { std::fclose(f); throw StoreError(StoreError::Code::Io, "cannot open GGUF source " + span_file); }
+            if (platform::seek_file(sf, sp.abs_offset) != 0 ||
+                std::fread(&src[k][0], 1, src[k].size(), sf) != src[k].size()) {
+                std::fclose(sf);
                 std::fclose(f);
                 throw StoreError(StoreError::Code::Io, "short read from GGUF source");
             }
+            std::fclose(sf);
         }
         std::fclose(f);
         h.gate_bytes = sizes[0];

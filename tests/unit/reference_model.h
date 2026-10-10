@@ -34,48 +34,68 @@ public:
         for (uint32_t l = 0; l < d.layers; ++l) {
             if (inputs) inputs->push_back(x);
             const std::string p = "blk." + std::to_string(l) + ".";
-            std::vector<Vec> q(n), k(n), v(n);
-            for (size_t t = 0; t < n; ++t) {
-                const Vec xn = rms(x[t], data(p + "attn_norm.weight"));
-                q[t] = projection(p + "attn_q", h, qw, xn);
-                k[t] = projection(p + "attn_k", h, kw, xn);
-                v[t] = projection(p + "attn_v", h, vw, xn);
-                if (d.qk_norm == synth::QkNorm::Full) {
-                    q[t] = rms(q[t], data(p + "attn_q_norm.weight"));
-                    k[t] = rms(k[t], data(p + "attn_k_norm.weight"));
-                } else if (d.qk_norm == synth::QkNorm::PerHead) {
-                    head_norm(q[t], d.heads, d.key, data(p + "attn_q_norm.weight"));
-                    head_norm(k[t], d.kv_heads, d.key, data(p + "attn_k_norm.weight"));
-                }
-                rope(q[t], d.heads, d.key, d.rope, double(t), d.base);
-                rope(k[t], d.kv_heads, d.key, d.rope, double(t), d.base);
-            }
-            const uint32_t group = d.heads / d.kv_heads;
-            const double scale = 1.0 / std::sqrt(double(d.key));
-            for (size_t t = 0; t < n; ++t) {
-                Vec attn(size_t(d.heads) * d.value, 0.0);
-                for (uint32_t hd = 0; hd < d.heads; ++hd) {
-                    const uint32_t kvh = hd / group;
-                    std::vector<double> s(t + 1);
-                    for (size_t j = 0; j <= t; ++j) {
-                        double dot = 0;
-                        for (uint32_t c = 0; c < d.key; ++c) dot += q[t][hd * d.key + c] * k[j][kvh * d.key + c];
-                        s[j] = dot * scale;
+            if (d.recurrent_at(l)) {
+                gated_delta_net(p, x);
+            } else {
+                std::vector<Vec> q(n), k(n), v(n), gate;
+                if (d.gated_q) gate.resize(n);
+                for (size_t t = 0; t < n; ++t) {
+                    const Vec xn = rms(x[t], data(p + "attn_norm.weight"));
+                    if (d.gated_q) {
+                        // joint [query | gate] projection, split per Q head
+                        const Vec qg = projection(p + "attn_q", h, 2 * qw, xn);
+                        q[t].resize(qw); gate[t].resize(qw);
+                        for (uint32_t hd = 0; hd < d.heads; ++hd)
+                            for (uint32_t c = 0; c < d.key; ++c) {
+                                q[t][hd * d.key + c] = qg[hd * 2 * d.key + c];
+                                gate[t][hd * d.key + c] = qg[hd * 2 * d.key + d.key + c];
+                            }
+                    } else {
+                        q[t] = projection(p + "attn_q", h, qw, xn);
                     }
-                    const double mx = *std::max_element(s.begin(), s.end());
-                    double sum = 0;
-                    for (auto& e : s) { e = std::exp(e - mx); sum += e; }
-                    for (size_t j = 0; j <= t; ++j) {
-                        const double w = s[j] / sum;
-                        for (uint32_t c = 0; c < d.value; ++c) attn[hd * d.value + c] += w * v[j][kvh * d.value + c];
+                    k[t] = projection(p + "attn_k", h, kw, xn);
+                    v[t] = projection(p + "attn_v", h, vw, xn);
+                    if (d.qk_norm == synth::QkNorm::Full) {
+                        q[t] = rms(q[t], data(p + "attn_q_norm.weight"));
+                        k[t] = rms(k[t], data(p + "attn_k_norm.weight"));
+                    } else if (d.qk_norm == synth::QkNorm::PerHead) {
+                        head_norm(q[t], d.heads, d.key, data(p + "attn_q_norm.weight"));
+                        head_norm(k[t], d.kv_heads, d.key, data(p + "attn_k_norm.weight"));
                     }
+                    rope(q[t], d.heads, d.key, d.rope, double(t), d.base);
+                    rope(k[t], d.kv_heads, d.key, d.rope, double(t), d.base);
                 }
-                Vec o = linear(data(p + "attn_output.weight"), uint32_t(attn.size()), h, attn);
-                for (uint32_t i = 0; i < h; ++i) x[t][i] += o[i];
+                const uint32_t group = d.heads / d.kv_heads;
+                const double scale = 1.0 / std::sqrt(double(d.key));
+                for (size_t t = 0; t < n; ++t) {
+                    Vec attn(size_t(d.heads) * d.value, 0.0);
+                    for (uint32_t hd = 0; hd < d.heads; ++hd) {
+                        const uint32_t kvh = hd / group;
+                        std::vector<double> s(t + 1);
+                        for (size_t j = 0; j <= t; ++j) {
+                            double dot = 0;
+                            for (uint32_t c = 0; c < d.key; ++c) dot += q[t][hd * d.key + c] * k[j][kvh * d.key + c];
+                            s[j] = dot * scale;
+                        }
+                        const double mx = *std::max_element(s.begin(), s.end());
+                        double sum = 0;
+                        for (auto& e : s) { e = std::exp(e - mx); sum += e; }
+                        for (size_t j = 0; j <= t; ++j) {
+                            const double w = s[j] / sum;
+                            for (uint32_t c = 0; c < d.value; ++c) attn[hd * d.value + c] += w * v[j][kvh * d.value + c];
+                        }
+                    }
+                    if (d.gated_q)  // attention output gated per head: attn *= sigmoid(gate)
+                        for (uint32_t hd = 0; hd < d.heads; ++hd)
+                            for (uint32_t c = 0; c < d.value; ++c)
+                                attn[hd * d.value + c] /= 1.0 + std::exp(-gate[t][hd * d.key + c]);
+                    Vec o = linear(data(p + "attn_output.weight"), uint32_t(attn.size()), h, attn);
+                    for (uint32_t i = 0; i < h; ++i) x[t][i] += o[i];
+                }
             }
             for (size_t t = 0; t < n; ++t) {
-                const Vec xn = rms(x[t], data(p + (m_.d.arch == "glm4moe" ? "post_attention_norm.weight" : "ffn_norm.weight")));
-                const Vec out = l < d.dense_layers ? dense_mlp(p, xn) : moe(p, xn);
+                const Vec xn = rms(x[t], data(p + d.ffn_norm_name()));
+                const Vec out = (l < d.dense_layers || d.experts == 0) ? dense_mlp(p, xn) : moe(p, xn);
                 for (uint32_t i = 0; i < h; ++i) x[t][i] += out[i];
             }
         }
@@ -85,6 +105,99 @@ public:
             result[t] = linear(data("output.weight"), h, d.vocab, xf);
         }
         return result;
+    }
+
+    // Gated DeltaNet block (Qwen3-Next / Qwen3.5 / Ornith), mirroring the pinned loaders:
+    //   qkv, z <- projections of the normed hidden state; beta/alpha <- ssm_ba (grouped) or
+    //   ssm_beta/ssm_alpha (split); co <- silu(depthwise causal conv over [history | qkv]);
+    //   q, k <- co / sqrt(sum(co^2) + eps) per key head (L2 norm);
+    //   beta <- sigmoid; g <- ssm_a * softplus(alpha + ssm_dt); S <- S * exp(g);
+    //   d <- (v - S^T k) * beta; S <- S + k x d; o <- S^T q / sqrt(D);
+    //   y <- rms(o) * ssm_norm * silu(z) per value head; x += ssm_out y.
+    void gated_delta_net(const std::string& p, std::vector<Vec>& x) const {
+        const auto& d = m_.d;
+        const size_t n = x.size();
+        const uint32_t h = d.hidden;
+        const uint32_t D = d.ssm_state, KH = d.ssm_groups, VH = d.ssm_dt, ratio = VH / KH;
+        const uint32_t key_w = KH * D, inner = d.ssm_inner, conv_w = 2 * key_w + inner;
+        const uint32_t K = d.conv_kernel, hist = K - 1;
+        const double eps = 1e-6;
+        std::vector<Vec> qkv(n), z(n), beta(n, Vec(VH)), alpha(n, Vec(VH));
+        for (size_t t = 0; t < n; ++t) {
+            const Vec xn = rms(x[t], data(p + "attn_norm.weight"));
+            qkv[t] = projection(p + "attn_qkv", h, conv_w, xn);
+            z[t] = projection(p + "attn_gate", h, inner, xn);
+            if (d.grouped_ssm) {
+                const Vec ba = projection(p + "ssm_ba", h, 2 * VH, xn);
+                for (uint32_t vh = 0; vh < VH; ++vh) {
+                    beta[t][vh] = ba[(vh / ratio) * 2 * ratio + vh % ratio];
+                    alpha[t][vh] = ba[(vh / ratio) * 2 * ratio + ratio + vh % ratio];
+                }
+            } else {
+                beta[t] = projection(p + "ssm_beta", h, VH, xn);
+                alpha[t] = projection(p + "ssm_alpha", h, VH, xn);
+            }
+        }
+        // extended conv input: zero-initialised history (K-1 rows, oldest first), then token rows
+        std::vector<double> ext((hist + n) * conv_w, 0.0);
+        for (size_t t = 0; t < n; ++t) std::copy(qkv[t].begin(), qkv[t].end(), ext.begin() + (hist + t) * conv_w);
+        const auto& cw = data(p + "ssm_conv1d.weight");
+        std::vector<Vec> co(n, Vec(conv_w));
+        for (size_t t = 0; t < n; ++t) for (uint32_t c = 0; c < conv_w; ++c) {
+            double sum = 0;
+            for (uint32_t j = 0; j < K; ++j) sum += cw[c * K + j] * ext[(t + j) * conv_w + c];
+            co[t][c] = sum / (1.0 + std::exp(-sum));  // SiLU
+        }
+        const auto& dtb = data(p + "ssm_dt.bias");
+        const auto& avec = data(p + "ssm_a");
+        const auto& nw = data(p + "ssm_norm.weight");
+        std::vector<double> S(size_t(VH) * D * D, 0.0);  // per value head [D x D], row = key, col = value
+        for (size_t t = 0; t < n; ++t) {
+            Vec qn(key_w), kn(key_w);
+            for (uint32_t kh = 0; kh < KH; ++kh) {
+                double nq = 0, nk = 0;
+                for (uint32_t i = 0; i < D; ++i) {
+                    const double qa = co[t][kh * D + i], ka = co[t][key_w + kh * D + i];
+                    nq += qa * qa; nk += ka * ka;
+                }
+                const double rq = 1.0 / std::sqrt(nq + eps), rk = 1.0 / std::sqrt(nk + eps);
+                for (uint32_t i = 0; i < D; ++i) { qn[kh * D + i] = co[t][kh * D + i] * rq; kn[kh * D + i] = co[t][key_w + kh * D + i] * rk; }
+            }
+            Vec gn(inner, 0.0);
+            for (uint32_t vh = 0; vh < VH; ++vh) {
+                const uint32_t kh = vh / ratio;
+                const double bt = 1.0 / (1.0 + std::exp(-beta[t][vh]));
+                const double sp = alpha[t][vh] + dtb[vh];
+                const double g = avec[vh] * (sp > 20.0 ? sp : std::log1p(std::exp(sp)));  // softplus
+                const double decay = std::exp(g);
+                double* Sh = &S[size_t(vh) * D * D];
+                for (uint32_t i = 0; i < D; ++i) for (uint32_t j = 0; j < D; ++j) Sh[i * D + j] *= decay;
+                std::vector<double> delta(D);
+                for (uint32_t j = 0; j < D; ++j) {
+                    double kv = 0;
+                    for (uint32_t i = 0; i < D; ++i) kv += Sh[i * D + j] * kn[kh * D + i];
+                    delta[j] = (co[t][2 * key_w + vh * D + j] - kv) * bt;
+                }
+                for (uint32_t i = 0; i < D; ++i) {
+                    const double ki = kn[kh * D + i];
+                    for (uint32_t j = 0; j < D; ++j) Sh[i * D + j] += ki * delta[j];
+                }
+                double ss = 0;
+                for (uint32_t j = 0; j < D; ++j) {
+                    double o = 0;
+                    for (uint32_t i = 0; i < D; ++i) o += Sh[i * D + j] * qn[kh * D + i];
+                    gn[vh * D + j] = o / std::sqrt(double(D));
+                    ss += gn[vh * D + j] * gn[vh * D + j];
+                }
+                const double inv = 1.0 / std::sqrt(ss / D + eps);  // RMS norm over the head dim
+                for (uint32_t j = 0; j < D; ++j) {
+                    const double zv = z[t][vh * D + j];
+                    gn[vh * D + j] = gn[vh * D + j] * inv * nw[j] * zv / (1.0 + std::exp(-zv));
+                }
+            }
+            const Vec o = linear(data(p + "ssm_out.weight"), inner, h, gn);
+            for (uint32_t i = 0; i < h; ++i) x[t][i] += o[i];
+        }
     }
 
     // Greedy continuation: returns the generated tokens (EOS included when produced).

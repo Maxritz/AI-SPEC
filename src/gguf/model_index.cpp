@@ -1,5 +1,8 @@
 #include "gguf/model_index.h"
+#include "util/hash.h"
 
+#include <cstdio>
+#include <map>
 #include <stdexcept>
 
 namespace knj::gguf {
@@ -85,7 +88,7 @@ ByteSpan ModelIndex::expert_span(ExpertId id, ExpertKind kind) const {
         const ExpertTensor& t = l.tensors[size_t(kind)];
         if (id.expert >= t.n_expert) break;
         return ByteSpan{t.span.abs_offset + uint64_t(id.expert) * t.bytes_per_expert,
-                        t.bytes_per_expert};
+                        t.bytes_per_expert, t.span.file};
     }
     throw std::out_of_range("expert_span: no such expert");
 }
@@ -99,7 +102,7 @@ ByteSpan ModelIndex::coalesced_extent(uint32_t layer, ExpertKind kind, uint32_t 
             throw std::out_of_range("coalesced_extent: expert range out of bounds");
         }
         return ByteSpan{t.span.abs_offset + uint64_t(first) * t.bytes_per_expert,
-                        uint64_t(count) * t.bytes_per_expert};
+                        uint64_t(count) * t.bytes_per_expert, t.span.file};
     }
     throw std::out_of_range("coalesced_extent: layer has no experts");
 }
@@ -113,11 +116,72 @@ ModelIndex load_model_index(const std::string& path) {
     idx.alignment = g.alignment;
     idx.data_offset = g.data_offset;
     idx.geometry = read_geometry(g);
-    idx.tensors = g.tensors;
     idx.metadata = g.kv;
 
     idx.fingerprint = g.fingerprint;
     idx.bytes_read_at_load = g.header_bytes_read;
+
+    // Sharded models (general.split_count > 1): every split is a complete GGUF whose
+    // tensor directory holds a subset of the model's tensors, named
+    // "<prefix>-NNNNN-of-MMMMM.gguf" (1-based). Merge the directories; each tensor's
+    // payload is read from the split file that lists it (pinned llama.cpp semantics:
+    // split_no must match the file's position, tensor names must not repeat, and
+    // general.split_tensors_count must equal the total).
+    auto kv_u32 = [&](const GgufFile& f, const std::string& key, uint32_t def) {
+        const Value* v = f.find_kv(key);
+        if (!v) return def;
+        uint64_t n = 0;
+        if (!v->as_uint(&n)) throw ParseError("GGUF metadata key " + key + " must be an unsigned integer");
+        return uint32_t(n);
+    };
+    const uint32_t split_count = kv_u32(g, "general.split_count", 1);
+    if (split_count > 1) {
+        const uint32_t split_no = kv_u32(g, "general.split_no", 0);
+        if (split_no != 0) throw ParseError("sharded model must be opened with its first split (split_no " + std::to_string(split_no) + " in " + path + ")");
+        // Derive the split prefix from the file name ("<prefix>-NNNNN-of-MMMMM.gguf").
+        const std::string suffix = "-" + std::to_string(split_no + 1) + "-of-" + std::to_string(split_count) + ".gguf";
+        const std::string padded = "-00001-of-" + std::to_string(split_count) + ".gguf";
+        std::string prefix;
+        if (path.size() > padded.size() && path.compare(path.size() - padded.size(), std::string::npos, padded) == 0)
+            prefix = path.substr(0, path.size() - padded.size());
+        else if (path.size() > suffix.size() && path.compare(path.size() - suffix.size(), std::string::npos, suffix) == 0)
+            prefix = path.substr(0, path.size() - suffix.size());
+        if (prefix.empty()) throw ParseError("cannot derive the split prefix from " + path + " (expected <prefix>-NNNNN-of-MMMMM.gguf)");
+        auto split_path = [&](uint32_t i) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "-%05u-of-%05u.gguf", i + 1, split_count);
+            return prefix + buf;
+        };
+        idx.split_paths.push_back(path);
+        std::map<std::string, bool> seen;
+        for (const TensorInfo& t : g.tensors) {
+            if (!seen.emplace(t.name, true).second) throw ParseError("invalid model: tensor '" + t.name + "' is duplicated");
+        }
+        std::string composite = g.fingerprint;
+        for (uint32_t i = 1; i < split_count; ++i) {
+            const std::string sp = split_path(i);
+            GgufFile sg = open_header(sp);
+            if (kv_u32(sg, "general.split_count", 1) != split_count) throw ParseError("GGUF split " + sp + " disagrees on general.split_count");
+            if (kv_u32(sg, "general.split_no", 0) != i) throw ParseError("GGUF split " + sp + " has the wrong general.split_no (expected " + std::to_string(i) + ")");
+            const Value* sa = sg.find_kv("general.architecture");
+            const Value* ma = g.find_kv("general.architecture");
+            if (!sa || !ma || sa->s != ma->s) throw ParseError("GGUF split " + sp + " disagrees on general.architecture");
+            for (TensorInfo t : sg.tensors) {
+                if (!seen.emplace(t.name, true).second) throw ParseError("invalid model: tensor '" + t.name + "' is duplicated across splits");
+                t.abs_offset = sg.data_offset + t.rel_offset;
+                t.file = sp;
+                g.tensors.push_back(std::move(t));
+            }
+            idx.split_paths.push_back(sp);
+            idx.bytes_read_at_load += sg.header_bytes_read;
+            composite += sg.fingerprint;
+        }
+        const uint64_t total = kv_u32(g, "general.split_tensors_count", uint32_t(g.tensors.size()));
+        if (total != g.tensors.size()) throw ParseError("corrupted model: " + std::to_string(total) + " tensors expected but " + std::to_string(g.tensors.size()) + " found across splits");
+        idx.tensors = g.tensors;
+        // The composite fingerprint covers every split's header and size.
+        idx.fingerprint = hash_text(composite);
+    }
 
     // Classify tensors: stacked expert tensors vs. resident trunk.
     struct Pending { ExpertLayer layer; bool present[3] = {false, false, false}; };
@@ -189,7 +253,7 @@ ModelIndex load_model_index(const std::string& path) {
         et.ggml_type = t.type;
         et.n_expert = n_expert;
         et.bytes_per_expert = bpe;
-        et.span = ByteSpan{t.abs_offset, t.nbytes};
+        et.span = ByteSpan{t.abs_offset, t.nbytes, t.file};
         idx.expert_bytes += t.nbytes;
     }
 

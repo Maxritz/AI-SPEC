@@ -99,6 +99,8 @@ KNJ_HD inline float weight(uint32_t t, const uint8_t* data, uint64_t index) {
         case 2: return half(u16(p)) * float(int((p[2 + i % 16] >> (i / 16 * 4)) & 15) - 8);
         case 3: return half(u16(p)) * float((p[4 + i % 16] >> (i / 16 * 4)) & 15) + half(u16(p + 2));
         case 6: case 7: {
+            // Q5_0/Q5_1: the 5th bit of element i is qh bit i (low nibbles at bits 0-15, high
+            // nibbles at bits 16-31) — see quantize_row_q5_0/q5_1 and dequantize_row_q5_0/q5_1.
             uint32_t start = t == 6 ? 2 : 4;
             int v = int((p[start + 4 + i % 16] >> (i / 16 * 4)) & 15) | int(((u32(p + start) >> i) & 1) << 4);
             return half(u16(p)) * float(v - (t == 6 ? 16 : 0)) + (t == 7 ? half(u16(p + 2)) : 0.0f);

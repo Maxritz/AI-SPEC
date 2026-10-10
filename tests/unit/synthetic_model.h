@@ -36,7 +36,25 @@ struct Dims {
     uint32_t groups = 1, groups_used = 1;       // group-limited expert selection
     bool normalize = true;                      // renormalise the selected top-k weights
     float scale = 1.0f;                         // routed weight scale (expert_weights_scale)
+    // Gated DeltaNet (Qwen3-Next / Qwen3.5 / Ornith) geometry. num_k_heads = ssm_groups,
+    // num_v_heads = ssm_dt, head dim = ssm_state, inner (value) width = ssm_inner = ssm_dt * ssm_state.
+    uint32_t conv_kernel = 0, ssm_inner = 0, ssm_state = 0, ssm_dt = 0, ssm_groups = 0;
+    std::vector<uint8_t> recurrent;             // per trunk layer: 1 = Gated DeltaNet block
+    bool gated_q = false;                       // full-attention blocks carry [query | gate] per Q head
+    bool grouped_ssm = false;                   // one ssm_ba projection (Qwen3-Next) vs ssm_beta/ssm_alpha
+    bool use_recurrent_interval = false;        // write full_attention_interval instead of the flag array
+    bool ffn_norm_alias = false;                // write ffn_norm.weight instead of the family's primary name
     uint32_t total() const { return layers + (mtp ? 1u : 0u); }
+    bool hybrid() const { return !recurrent.empty(); }
+    bool recurrent_at(uint32_t l) const { return l < recurrent.size() && recurrent[l] != 0; }
+    uint32_t kv_layer_count() const { uint32_t c = 0; for (uint32_t l = 0; l < layers; ++l) if (!recurrent_at(l)) ++c; return c; }
+    uint32_t kv_total() const { return kv_layer_count() + (mtp ? 1u : 0u); }
+    // FFN input norm name this fixture writes (the pinned loaders read post_attention_norm for
+    // glm4moe and the Gated DeltaNet hybrids, ffn_norm elsewhere).
+    std::string ffn_norm_name() const {
+        if (ffn_norm_alias) return "ffn_norm.weight";
+        return arch == "glm4moe" || hybrid() ? "post_attention_norm.weight" : "ffn_norm.weight";
+    }
 };
 
 // Family profiles. Each mirrors the option set of the upstream definition it names.
@@ -69,6 +87,33 @@ inline Dims family(const std::string& arch) {
         d.normalize = true; d.scale = 1.5f;
         d.shared = 1; d.shared_ff = 12;
         d.dense_layers = 1; d.dense_ff = 16;
+        d.mtp = true;
+        return d;
+    }
+    if (arch == "qwen35") {  // hybrid dense (Ornith 1.0/1.5 9B profile): GDN + gated-Q attention, split beta/alpha, NextN
+        d.layers = 4; d.qk_norm = QkNorm::PerHead; d.experts = 0; d.used = 0;
+        d.dense_layers = d.layers; d.dense_ff = d.ff;
+        d.conv_kernel = 4; d.ssm_state = 8; d.ssm_groups = 2; d.ssm_dt = 4; d.ssm_inner = 32;
+        d.recurrent = {1, 1, 1, 0}; d.gated_q = true; d.grouped_ssm = false;
+        d.mtp = true;
+        return d;
+    }
+    if (arch == "qwen35moe") {  // hybrid MoE (Ornith 1.0/1.5 35B-A3B profile): shared expert with sigmoid gate, interval flags
+        d.layers = 4; d.qk_norm = QkNorm::PerHead;
+        d.conv_kernel = 4; d.ssm_state = 8; d.ssm_groups = 2; d.ssm_dt = 4; d.ssm_inner = 32;
+        d.recurrent = {1, 1, 1, 0}; d.gated_q = true; d.grouped_ssm = false;
+        d.use_recurrent_interval = true;
+        d.shared = 1; d.shared_ff = 8; d.shared_gate = true;
+        d.normalize = true;
+        d.mtp = true;
+        return d;
+    }
+    if (arch == "qwen3next") {  // hybrid MoE: grouped ssm_ba projection, shared expert, NextN
+        d.layers = 4; d.qk_norm = QkNorm::PerHead;
+        d.conv_kernel = 4; d.ssm_state = 8; d.ssm_groups = 2; d.ssm_dt = 4; d.ssm_inner = 32;
+        d.recurrent = {1, 1, 1, 0}; d.gated_q = true; d.grouped_ssm = true;
+        d.shared = 1; d.shared_ff = 8; d.shared_gate = true;
+        d.normalize = true;
         d.mtp = true;
         return d;
     }
@@ -120,27 +165,50 @@ inline Model build(const Dims& d, uint32_t seed) {
     for (uint32_t l = 0; l < d.total(); ++l) {
         const std::string p = "blk." + std::to_string(l) + ".";
         add(p + "attn_norm.weight", {d.hidden}, 0, true);
-        add(p + "attn_q.weight", {d.hidden, uint64_t(d.heads) * d.key}, 1 / std::sqrt(h));
-        add(p + "attn_k.weight", {d.hidden, uint64_t(d.kv_heads) * d.key}, 1 / std::sqrt(h));
-        add(p + "attn_v.weight", {d.hidden, uint64_t(d.kv_heads) * d.value}, 1 / std::sqrt(h));
-        add(p + "attn_output.weight", {uint64_t(d.heads) * d.value, d.hidden}, 1 / std::sqrt(float(d.heads * d.value)));
-        if (d.qkv_bias) {
-            add(p + "attn_q.bias", {uint64_t(d.heads) * d.key}, 0.3f);
-            add(p + "attn_k.bias", {uint64_t(d.kv_heads) * d.key}, 0.3f);
-            add(p + "attn_v.bias", {uint64_t(d.kv_heads) * d.value}, 0.3f);
+        if (d.recurrent_at(l)) {
+            // Gated DeltaNet block: fused qkv projection (width 2*groups*D + inner), gate projection,
+            // depthwise causal conv, per-head decay bias, grouped or split beta/alpha, gated norm, output.
+            const uint32_t key_w = d.ssm_groups * d.ssm_state, conv_w = 2 * key_w + d.ssm_inner;
+            add(p + "attn_qkv.weight", {d.hidden, conv_w}, 1 / std::sqrt(h));
+            add(p + "attn_gate.weight", {d.hidden, d.ssm_inner}, 1 / std::sqrt(h));
+            add(p + "ssm_conv1d.weight", {d.conv_kernel, conv_w}, 0.5f / std::sqrt(float(conv_w)));
+            add(p + "ssm_dt.bias", {d.ssm_dt}, 0.3f);
+            add(p + "ssm_a", {d.ssm_dt}, -0.5f);
+            if (d.grouped_ssm) {
+                add(p + "ssm_ba.weight", {d.hidden, 2 * uint64_t(d.ssm_dt)}, 1 / std::sqrt(h));
+            } else {
+                add(p + "ssm_beta.weight", {d.hidden, d.ssm_dt}, 1 / std::sqrt(h));
+                add(p + "ssm_alpha.weight", {d.hidden, d.ssm_dt}, 1 / std::sqrt(h));
+            }
+            add(p + "ssm_norm.weight", {d.ssm_state}, 0, true);
+            add(p + "ssm_out.weight", {d.ssm_inner, d.hidden}, 1 / std::sqrt(float(d.ssm_inner)));
+        } else {
+            // Full-attention block; gated-Q families concatenate [query | gate] per Q head.
+            const uint32_t q_rows = d.gated_q ? 2 * d.heads * d.key : d.heads * d.key;
+            add(p + "attn_q.weight", {d.hidden, q_rows}, 1 / std::sqrt(h));
+            add(p + "attn_k.weight", {d.hidden, uint64_t(d.kv_heads) * d.key}, 1 / std::sqrt(h));
+            add(p + "attn_v.weight", {d.hidden, uint64_t(d.kv_heads) * d.value}, 1 / std::sqrt(h));
+            add(p + "attn_output.weight", {uint64_t(d.heads) * d.value, d.hidden}, 1 / std::sqrt(float(d.heads * d.value)));
+            if (d.qkv_bias) {
+                add(p + "attn_q.bias", {q_rows}, 0.3f);
+                add(p + "attn_k.bias", {uint64_t(d.kv_heads) * d.key}, 0.3f);
+                add(p + "attn_v.bias", {uint64_t(d.kv_heads) * d.value}, 0.3f);
+            }
+            if (d.qk_norm == QkNorm::PerHead) {
+                add(p + "attn_q_norm.weight", {d.key}, 0, true);
+                add(p + "attn_k_norm.weight", {d.key}, 0, true);
+            } else if (d.qk_norm == QkNorm::Full) {
+                add(p + "attn_q_norm.weight", {uint64_t(d.heads) * d.key}, 0, true);
+                add(p + "attn_k_norm.weight", {uint64_t(d.kv_heads) * d.key}, 0, true);
+            }
         }
-        if (d.qk_norm == QkNorm::PerHead) {
-            add(p + "attn_q_norm.weight", {d.key}, 0, true);
-            add(p + "attn_k_norm.weight", {d.key}, 0, true);
-        } else if (d.qk_norm == QkNorm::Full) {
-            add(p + "attn_q_norm.weight", {uint64_t(d.heads) * d.key}, 0, true);
-            add(p + "attn_k_norm.weight", {uint64_t(d.kv_heads) * d.key}, 0, true);
-        }
-        add(p + (d.arch == "glm4moe" ? "post_attention_norm.weight" : "ffn_norm.weight"), {d.hidden}, 0, true);
-        if (l < d.dense_layers) {
-            add(p + "ffn_gate.weight", {d.hidden, d.dense_ff}, 1 / std::sqrt(h));
-            add(p + "ffn_up.weight", {d.hidden, d.dense_ff}, 1 / std::sqrt(h));
-            add(p + "ffn_down.weight", {d.dense_ff, d.hidden}, 1 / std::sqrt(float(d.dense_ff)));
+        add(p + d.ffn_norm_name(), {d.hidden}, 0, true);
+        const bool dense_ffn = l < d.dense_layers || d.experts == 0;  // dense families FFN every block incl. MTP
+        if (dense_ffn) {
+            const uint32_t w = l < d.dense_layers ? d.dense_ff : d.ff;
+            add(p + "ffn_gate.weight", {d.hidden, w}, 1 / std::sqrt(h));
+            add(p + "ffn_up.weight", {d.hidden, w}, 1 / std::sqrt(h));
+            add(p + "ffn_down.weight", {w, d.hidden}, 1 / std::sqrt(float(w)));
             continue;
         }
         if (d.experts == 0) continue;
@@ -165,7 +233,7 @@ inline Model build(const Dims& d, uint32_t seed) {
     return m;
 }
 
-inline std::string gguf_bytes(const Model& m, const std::string& name) {
+inline testgguf::Spec gguf_spec(const Model& m, const std::string& name) {
     const Dims& d = m.d;
     const std::string p = d.arch + ".";
     testgguf::Spec spec;
@@ -207,6 +275,24 @@ inline std::string gguf_bytes(const Model& m, const std::string& name) {
     }
     if (d.dense_layers) spec.kv.push_back(testgguf::kv_u32(p + "leading_dense_block_count", d.dense_layers));
     if (d.mtp) spec.kv.push_back(testgguf::kv_u32(p + "nextn_predict_layers", 1));
+    if (d.hybrid()) {
+        // Hybrid Gated DeltaNet metadata (names as the pinned loaders read them).
+        spec.kv.push_back(testgguf::kv_u32(p + "ssm.conv_kernel", d.conv_kernel));
+        spec.kv.push_back(testgguf::kv_u32(p + "ssm.inner_size", d.ssm_inner));
+        spec.kv.push_back(testgguf::kv_u32(p + "ssm.state_size", d.ssm_state));
+        spec.kv.push_back(testgguf::kv_u32(p + "ssm.time_step_rank", d.ssm_dt));
+        spec.kv.push_back(testgguf::kv_u32(p + "ssm.group_count", d.ssm_groups));
+        if (d.use_recurrent_interval) {
+            // attention.full_attention_interval N marks layers l with l % N == N-1 as full attention
+            uint32_t interval = 0;
+            for (uint32_t l = 0; l < d.layers; ++l) if (!d.recurrent_at(l)) { interval = l + 1; break; }
+            if (interval) spec.kv.push_back(testgguf::kv_u32(p + "full_attention_interval", interval));  // pinned key: %s.full_attention_interval
+        } else {
+            // dense per-block flag array over every block (trunk + MTP), as the pinned loaders read it
+            spec.kv.push_back(testgguf::kv_arr_bool(p + "attention.recurrent_layers",
+                [&] { std::vector<uint8_t> v(d.total(), 0); for (uint32_t l = 0; l < d.total(); ++l) v[l] = d.recurrent_at(l) ? 1 : 0; return v; }()));
+        }
+    }
     for (const auto& [tensor_name, t] : m.tensors) {
         testgguf::Tensor out;
         out.name = tensor_name;
@@ -215,7 +301,11 @@ inline std::string gguf_bytes(const Model& m, const std::string& name) {
         out.data.assign(reinterpret_cast<const char*>(t.data.data()), t.data.size() * sizeof(float));
         spec.tensors.push_back(std::move(out));
     }
-    return testgguf::bytes(spec);
+    return spec;
+}
+
+inline std::string gguf_bytes(const Model& m, const std::string& name) {
+    return testgguf::bytes(gguf_spec(m, name));
 }
 
 inline void write(const Model& m, const std::string& path, const std::string& name = "") {

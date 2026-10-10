@@ -7,6 +7,8 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <optional>
 namespace knj::inference {
 void Options::validate() const {
     sampling.validate();
@@ -75,10 +77,11 @@ Engine::Engine(const std::string& path, Config config, int device) : config_(std
     tuner_ = std::make_unique<Autotuner>(config_.tune_dir, backend_->caps().gcn_arch, backend_->caps().driver, platform::executable_hash(), "knj-abi-1");
     model_->tune(*tuner_, config_.wmma);
     kv::Identity identity{index_.fingerprint, backend_->caps().gcn_arch, tokenizer_->identity(), spec_.rope_identity};
-    identity.codec = codec(config_.kv_codec); identity.block_tokens = budget_.token_block; identity.layer_slab = std::min(budget_.layer_slab, spec_.layers);
+    identity.codec = codec(config_.kv_codec); identity.block_tokens = budget_.token_block; identity.layer_slab = std::min(budget_.layer_slab, spec_.kv_layers);
     uint64_t mtp_hot = spec_.mtp_layers ? align_up(budget_.hot_kv * spec_.mtp_layers / spec_.total_layers, 256) : 0;
     require(mtp_hot < budget_.hot_kv, "MTP KV split consumed target context budget");
-    cache_ = std::make_unique<kv::Cache>(runtime_, *transfers_, *warm_, profile_, identity, kv::Geometry{spec_.layers, spec_.kv_heads, spec_.key_dim, spec_.value_dim}, budget_.hot_kv - mtp_hot, dir + "/kv", budget_.nvme_quota);
+    // Hybrid (Gated DeltaNet) models keep one KV slot per full-attention layer only.
+    cache_ = std::make_unique<kv::Cache>(runtime_, *transfers_, *warm_, profile_, identity, kv::Geometry{spec_.kv_layers, spec_.kv_heads, spec_.key_dim, spec_.value_dim}, budget_.hot_kv - mtp_hot, dir + "/kv", budget_.nvme_quota);
     prefixes_ = std::make_unique<kv::RadixIndex>(identity);
     attention_ = std::make_unique<attn::Attention>(runtime_, *transfers_, *cache_, profile_);
     if (spec_.mtp_layers) {
@@ -121,6 +124,7 @@ std::shared_ptr<Generation> Engine::create_session(std::vector<int32_t> prompt, 
     auto g = std::make_shared<Generation>(options, tenant);
     g->prompt = std::move(prompt); g->history = g->prompt; g->admission = admission;
     g->kv = std::make_unique<kv::Session>(*cache_, admission, admission.context_cap + rollback);
+    if (model_->has_recurrent()) { g->recurrent = model_->new_recurrent_state(); }
     if (spec_.mtp_layers && options.speculate && !drafter_) {
         residency::Admission head{true, residency::ContextClass::Resident, std::min(spec_.context, uint32_t(mtp_cache_->hot_capacity() / mtp_cache_->bytes_per_token())), requested};
         g->mtp_kv = std::make_unique<kv::Session>(*mtp_cache_, head, std::min(head.context_cap, options.max_new_tokens + config_.max_draft_width + mtp_cache_->identity().block_tokens));
@@ -128,9 +132,10 @@ std::shared_ptr<Generation> Engine::create_session(std::vector<int32_t> prompt, 
     if (drafter_ && options.speculate) {
         g->dflash_kv = std::make_unique<dflash::Cache>(drafter_->make_cache());
     }
-    // Prefix pages carry no drafter state. Drafter-enabled requests therefore
-    // prefill from scratch so their drafter cache is derived from real target features.
-    if (reuse_prefix && config_.use_prefix_cache && !g->mtp_kv && !g->dflash_kv) {
+    // Prefix pages carry no drafter state and no recurrent (Gated DeltaNet) state. Drafter-enabled
+    // requests and hybrid models therefore prefill from scratch so their caches are derived from
+    // real target features (docs/02 C12: hybrid prefixes need replay-suffix rollback, not reuse).
+    if (reuse_prefix && config_.use_prefix_cache && !g->mtp_kv && !g->dflash_kv && !model_->has_recurrent()) {
         auto hit = prefixes_->lookup(g->prompt, tenant);
         if (hit.tokens) {
             g->kv->attach_prefix(hit.blocks, hit.tokens); g->prefilled = hit.tokens; g->reused = hit.tokens;
@@ -156,7 +161,7 @@ std::vector<double> Engine::score(const std::vector<int32_t>& tokens, uint32_t c
     for (uint32_t start = 0; start < tokens.size();) {
         const uint32_t count = std::min<uint32_t>(step, uint32_t(tokens.size()) - start);
         std::vector<int32_t> part(tokens.begin() + start, tokens.begin() + start + count);
-        auto result = model_->forward(*g->kv, *cache_, *attention_, part, true, never);
+        auto result = model_->forward(*g->kv, *cache_, *attention_, part, true, never, {}, model_->has_recurrent() ? &g->recurrent : nullptr);
         for (uint32_t j = 0; j < count && start + j + 1 < tokens.size(); ++j) {
             const float* row = result.logits.data() + uint64_t(j) * V;
             double maximum = row[0];
@@ -267,12 +272,27 @@ std::vector<int32_t> Engine::step(Generation& g) {
                 draft.push_back(candidate);
             }
             uint32_t start = g.kv->size();
-            auto result = model_->forward(*g.kv, *cache_, *attention_, draft, true, cancelled);
+            // The draft forward advances the recurrent (Gated DeltaNet) state past every draft row;
+            // snapshot it so a rejection can roll back to the committed position and replay the
+            // accepted prefix (the recurrent state has no per-token undo, unlike the KV cache).
+            std::optional<model::RecurrentState> recurrent_snapshot;
+            if (model_->has_recurrent()) { recurrent_snapshot = model_->clone_recurrent_state(g.recurrent); }
+            auto result = model_->forward(*g.kv, *cache_, *attention_, draft, true, cancelled, {}, &g.recurrent);
             remember(g, start, result);
             auto verification = spec::verify(draft, g.logits, result.logits, g.sampler, g.history, g.options.max_new_tokens - uint32_t(g.output.size()));
             require(!verification.accepted.empty(), "coupled root did not match its own preview");
             uint32_t accepted = uint32_t(verification.accepted.size());
-            g.kv->truncate(start + accepted); forget_from(g, start + accepted);
+            // On rejection the recurrent state must roll back to the committed position and the
+            // accepted prefix is replayed through the model: the replay rewrites those KV rows at
+            // their true positions (the session is truncated to the pre-draft position) and
+            // re-advances the recurrent state. Without a recurrent state the accepted KV rows are
+            // already correct, so they are kept and nothing is replayed.
+            const bool replay = recurrent_snapshot && accepted < draft.size();
+            g.kv->truncate(replay ? start : start + accepted); forget_from(g, start + accepted);
+            if (replay) {
+                model_->restore_recurrent_state(g.recurrent, *recurrent_snapshot);
+                model_->forward(*g.kv, *cache_, *attention_, verification.accepted, false, cancelled, {}, &g.recurrent);
+            }
             // Drafted MTP entries used chained hiddens; the canonical entries are re-derived by sync_mtp.
             g.mtp_kv->truncate(head_start);
             for (auto token : verification.accepted) { emit(g, token); if (g.done) { break; } }
@@ -283,7 +303,7 @@ std::vector<int32_t> Engine::step(Generation& g) {
                 emit(g, *verification.replacement);
                 if (!g.done) {
                     uint32_t next_start = g.kv->size();
-                    auto replacement = model_->forward(*g.kv, *cache_, *attention_, {*verification.replacement}, false, cancelled);
+                    auto replacement = model_->forward(*g.kv, *cache_, *attention_, {*verification.replacement}, false, cancelled, {}, &g.recurrent);
                     g.hidden = replacement.hidden; g.logits = replacement.logits; remember(g, next_start, replacement); index_result(g, next_start, replacement);
                 }
             }
@@ -303,7 +323,7 @@ model::Result Engine::forward_target(Generation& g, const std::vector<int32_t>& 
     const uint32_t start = g.kv->size();
     std::vector<uint32_t> capture;
     if (g.dflash_kv) { capture = drafter_->spec().target_layers; }
-    auto result = model_->forward(*g.kv, *cache_, *attention_, tokens, all, cancelled, capture);
+    auto result = model_->forward(*g.kv, *cache_, *attention_, tokens, all, cancelled, capture, model_->has_recurrent() ? &g.recurrent : nullptr);
     if (g.dflash_kv) {
         // Features are the target layer inputs in target_layers order, one row per position.
         require(g.dflash_kv->size() == start, "DFlash drafter cache is not aligned with the target sequence");
@@ -342,11 +362,22 @@ void Engine::speculate_dflash(Generation& g, const std::function<bool()>& cancel
             if (tokenizer_->eog(draft.tokens[k])) { break; }
         }
     }
+    // As in the MTP path: snapshot the recurrent state so a rejection can roll back and replay.
+    std::optional<model::RecurrentState> recurrent_snapshot;
+    if (model_->has_recurrent()) { recurrent_snapshot = model_->clone_recurrent_state(g.recurrent); }
     auto result = forward_target(g, chain, true, cancelled);
     auto verification = spec::verify(chain, g.logits, result.logits, g.sampler, g.history, g.options.max_new_tokens - uint32_t(g.output.size()));
     require(!verification.accepted.empty(), "coupled root did not match its own preview");
     const uint32_t accepted = uint32_t(verification.accepted.size());
-    g.kv->truncate(start + accepted); forget_from(g, start + accepted); g.dflash_kv->truncate(start + accepted);
+    // As in the MTP path: a recurrent model replays the accepted prefix from the pre-draft
+    // position, which rewrites the KV rows and re-derives the drafter features of the accepted
+    // rows (both caches are truncated to that position); otherwise the accepted rows are kept.
+    const bool replay = recurrent_snapshot && accepted < chain.size();
+    g.kv->truncate(replay ? start : start + accepted); forget_from(g, start + accepted); g.dflash_kv->truncate(replay ? start : start + accepted);
+    if (replay) {
+        model_->restore_recurrent_state(g.recurrent, *recurrent_snapshot);
+        forward_target(g, verification.accepted, false, cancelled);
+    }
     for (auto token : verification.accepted) { emit(g, token); if (g.done) { break; } }
     g.hidden.assign(result.hidden.begin() + uint64_t(accepted - 1) * spec_.hidden, result.hidden.begin() + uint64_t(accepted) * spec_.hidden);
     g.logits.assign(result.logits.begin() + uint64_t(accepted - 1) * spec_.vocabulary, result.logits.begin() + uint64_t(accepted) * spec_.vocabulary);
@@ -365,6 +396,14 @@ void Engine::suspend(Generation& g, const std::string& path) {
     require(g.kv && g.kv->size() && !g.hidden.empty(), "cannot checkpoint an unprefilled session");
     auto state = g.sampler.state(); state["tenant"] = g.tenant; state["prompt"] = g.prompt; state["output"] = g.output; state["text"] = g.text; state["prefilled"] = g.prefilled;
     g.kv->suspend(path, g.history, state, g.hidden);
+    if (model_->has_recurrent()) {
+        // The recurrent (Gated DeltaNet) state has no KV pages to rebuild it from: persist it as a sidecar.
+        const auto bytes = model_->export_recurrent_state(g.recurrent);
+        std::ofstream out(path + ".rstate", std::ios::binary);
+        require(out.good(), "cannot write recurrent state sidecar " + path + ".rstate");
+        out.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+        require(out.good(), "short write on recurrent state sidecar");
+    }
     g.mtp_kv.reset(); g.dflash_kv.reset(); g.recent.clear();
 }
 std::shared_ptr<Generation> Engine::resume(const std::string& path, uint32_t count, const std::string& tenant) {
@@ -375,10 +414,17 @@ std::shared_ptr<Generation> Engine::resume(const std::string& path, uint32_t cou
     auto g = create(history, options, tenant);
     g->kv.reset(); g->kv = std::make_unique<kv::Session>(*cache_, g->admission, g->admission.context_cap);
     auto state = g->kv->resume(path);
+    if (model_->has_recurrent()) {
+        std::ifstream in(path + ".rstate", std::ios::binary);
+        require(in.good(), "missing recurrent state sidecar for a hybrid model checkpoint");
+        std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        model_->import_recurrent_state(g->recurrent, bytes);
+        require(g->recurrent.tokens == g->kv->size(), "recurrent state position disagrees with the checkpoint");
+    }
     g->sampler.restore(state.at("sampling")); g->history = history; g->prompt = history; g->prefilled = g->kv->size();
     g->hidden = state.at("last_hidden").get<std::vector<float>>();
     if (g->prefilled < history.size()) {
-        auto result = model_->forward(*g->kv, *cache_, *attention_, {history.begin() + g->prefilled, history.end()}, false);
+        auto result = model_->forward(*g->kv, *cache_, *attention_, {history.begin() + g->prefilled, history.end()}, false, {}, {}, &g->recurrent);
         g->hidden.assign(result.hidden.end() - spec_.hidden, result.hidden.end()); g->logits = std::move(result.logits); g->prefilled = uint32_t(history.size());
     } else {
         g->logits = model_->logits(g->hidden);

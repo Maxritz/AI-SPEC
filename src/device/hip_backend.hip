@@ -63,6 +63,7 @@ public:
 #define KNJ_HIP_OP(name, plan) void name(const compute::plan& p, StreamId id) override { kernels::name(p, stream(id)); launched(); }
     KNJ_HIP_OP(norm, NormPlan) KNJ_HIP_OP(activation, ActivationPlan) KNJ_HIP_OP(add, AddPlan) KNJ_HIP_OP(embed, EmbedPlan) KNJ_HIP_OP(rearrange, RearrangePlan) KNJ_HIP_OP(rope, RopePlan)
     KNJ_HIP_OP(expert, ExpertPlan) KNJ_HIP_OP(accumulate, AccumulatePlan) KNJ_HIP_OP(kv_write, KvWritePlan) KNJ_HIP_OP(attention_init, AttentionPlan) KNJ_HIP_OP(attention_page, AttentionPagePlan) KNJ_HIP_OP(attention_finish, AttentionPlan)
+    KNJ_HIP_OP(conv, ConvPlan) KNJ_HIP_OP(gdn_scan, GdnScanPlan) KNJ_HIP_OP(gated_norm, GatedNormPlan) KNJ_HIP_OP(sigmoid_gate, SigmoidGatePlan)
 #undef KNJ_HIP_OP
 };
 }

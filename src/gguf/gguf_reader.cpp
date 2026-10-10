@@ -261,6 +261,12 @@ GgufFile open_header(const std::string& path) {
             throw ParseError("tensor " + t.name + " element count is not a multiple of " + ti.name +
                              " block size");
         }
+        if (t.dims[0] % ti.block_elems != 0) {
+            // The canonical gguf reader rejects a quantized tensor whose innermost (row)
+            // dimension is not a whole number of blocks; match it rather than parse garbage.
+            throw ParseError("tensor " + t.name + " row size is not a multiple of " + ti.name +
+                             " block size");
+        }
         t.nbytes = (t.nelements / ti.block_elems) * ti.block_bytes;
         t.rel_offset = c.u64();
         if (t.rel_offset % g.alignment != 0) {

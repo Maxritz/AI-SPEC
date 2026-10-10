@@ -47,6 +47,9 @@ struct ExpertId {
 struct ByteSpan {
     uint64_t abs_offset = 0;
     uint64_t nbytes = 0;
+    // Sharded models: the split file holding the span (empty for the main file).
+    std::string file;
+    std::string payload_path(const std::string& main_path) const { return file.empty() ? main_path : file; }
 };
 
 // One stacked expert tensor for one layer (e.g. blk.3.ffn_up_exps.weight).
@@ -73,6 +76,8 @@ struct ModelIndex {
     uint64_t trunk_bytes = 0;     // non-expert tensor payload (resident trunk)
     uint64_t expert_bytes = 0;    // total expert payload (cold; never read at load)
     uint64_t bytes_read_at_load = 0;  // every byte this load consumed from the file (header only)
+    // Sharded models: every split path, main (split 0) first. Empty for single-file models.
+    std::vector<std::string> split_paths;
     ModelGeometry geometry;
     std::vector<TensorInfo> tensors;   // copied from the header
     std::vector<ExpertLayer> experts;  // MoE layers, ascending layer order
