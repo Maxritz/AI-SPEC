@@ -4,10 +4,11 @@
 #include "util/checked.h"
 #include <algorithm>
 #include <mutex>
+#include <utility>
 namespace knj::gpu {
 struct SlotPool::Impl {
     device::Buffer arena; uint64_t stride; std::vector<ExpertSlot> slots; mutable std::mutex mutex; profile::Counters* counters;
-    struct Retired { SlotHandle slot; Ticket event; bool loading; }; std::vector<Retired> retired;
+    struct Retired { SlotHandle slot; Ticket event; bool loading; }; std::vector<Retired> retired; SlotPriority priority;
     ExpertSlot& checked(SlotHandle h) { require(h.index < slots.size(), "slot index out of range"); auto& s = slots[h.index]; if (s.generation != h.generation || s.state == SlotState::Free) throw Error(ErrorCode::Invariant, "stale slot generation"); return s; }
     void free(ExpertSlot& s) { s.state = SlotState::Free; s.byte_size = 0; s.use_count = 0; ++s.generation; }
 };
@@ -17,10 +18,15 @@ SlotPool::SlotPool(std::shared_ptr<device::Backend> b, uint32_t count, uint64_t 
 SlotHandle SlotPool::acquire(gguf::ExpertId id, uint64_t bytes) {
     poll(); auto& p = *impl_; std::lock_guard<std::mutex> l(p.mutex); require(bytes && bytes <= p.stride, "expert exceeds slot stride");
     for (uint32_t i = 0; i < p.slots.size(); ++i) if (p.slots[i].state != SlotState::Free && p.slots[i].id == id) return {i, p.slots[i].generation};
-    uint32_t choice = UINT32_MAX; uint64_t oldest = UINT64_MAX;
+    uint32_t choice = UINT32_MAX; uint64_t oldest = UINT64_MAX; double weakest = 0;
     for (uint32_t i = 0; i < p.slots.size(); ++i) {
         auto& s = p.slots[i]; if (s.state == SlotState::Free) { choice = i; break; }
-        if (s.state == SlotState::Resident && s.use_count == 0 && s.last_use < oldest) { oldest = s.last_use; choice = i; }
+        // Loading, in-use and event-referenced slots are never candidates, so a
+        // prefetch in flight is protected until the request settles it.
+        if (s.state == SlotState::Resident && s.use_count == 0) {
+            double rank = p.priority ? p.priority(s.id) : 0;
+            if (choice == UINT32_MAX || rank < weakest || (rank == weakest && s.last_use < oldest)) { weakest = rank; oldest = s.last_use; choice = i; }
+        }
     }
     if (choice == UINT32_MAX) throw Error(ErrorCode::ResourceExhausted, "all expert slots are event-referenced; execute another wave after retirement");
     auto& s = p.slots[choice]; if (s.state != SlotState::Free && p.counters) ++p.counters->slot_evictions;
@@ -40,6 +46,7 @@ bool SlotPool::evict(SlotHandle h) {
     if (s.state == SlotState::Loading || s.use_count) return false;
     p.free(s); if (p.counters) ++p.counters->slot_evictions; return true;
 }
+void SlotPool::set_priority(SlotPriority judge) { auto& p = *impl_; std::lock_guard<std::mutex> l(p.mutex); p.priority = std::move(judge); }
 void SlotPool::poll() {
     auto& p = *impl_; std::lock_guard<std::mutex> l(p.mutex);
     for (auto it = p.retired.begin(); it != p.retired.end();) {

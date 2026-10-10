@@ -48,7 +48,7 @@ add_library(knj_runtime STATIC
   src/device/backend.cpp src/profile/profiler.cpp src/core/runtime.cpp
   src/core/config.cpp src/core/budget.cpp src/core/autotuner.cpp
   src/host/pools.cpp src/gpu/slot_pool.cpp src/transfer/engine.cpp
-  src/residency/admission.cpp src/residency/predictor.cpp src/residency/manager.cpp
+  src/residency/admission.cpp src/residency/predictor.cpp src/residency/activation.cpp src/residency/manager.cpp
   src/compute/executor.cpp src/kv/cache.cpp src/kv/radix.cpp src/attn/attention.cpp)
 target_link_libraries(knj_runtime PUBLIC knj_store knj_io)
 if(KNJ_ENABLE_HIP)
@@ -106,7 +106,7 @@ add_executable(kanjoos-store src/tools/kanjoos_store.cpp)
 target_link_libraries(kanjoos-store PRIVATE knj_store)
 if(KNJ_BUILD_TESTS)
   enable_testing()
-  foreach(name substrate router store runtime kv compiler)
+  foreach(name substrate router store runtime kv compiler activation)
     if(name STREQUAL "store" AND WIN32)
       continue() # POSIX process-death harness; portable store tests run in engine suite.
     endif()

@@ -32,7 +32,7 @@ struct Manager::Impl {
     store::ExpertStore& store; const gguf::ModelIndex& index; host::WarmPool& warm; gpu::SlotPool& slots; transfer::Engine& transfers; Runtime& runtime; profile::Profiler& profile;
     struct Entry { State state = State::NvmeResident; device::Buffer warm; std::optional<gpu::SlotHandle> slot; std::shared_ptr<transfer::Transfer> copy; std::string extent; bool want_hot = false, speculative = false, active = false; uint64_t last_use = 0, frequency = 0; std::exception_ptr error; };
     struct Read { store::Extent extent; std::shared_ptr<transfer::Transfer> transfer; };
-    std::map<uint64_t, Entry> entries; std::map<std::string, Read> reads; mutable std::mutex mutex;
+    std::map<uint64_t, Entry> entries; std::map<std::string, Read> reads; std::vector<gguf::ExpertId> missed; mutable std::mutex mutex;
     Impl(store::ExpertStore& s, const gguf::ModelIndex& i, host::WarmPool& w, gpu::SlotPool& slots_, transfer::Engine& t, Runtime& r, profile::Profiler& p) : store(s), index(i), warm(w), slots(slots_), transfers(t), runtime(r), profile(p) {
         for (const auto& l : i.experts) for (uint32_t e = 0; e < l.tensors[0].n_expert; ++e) entries.emplace(key({l.layer, e}), Entry{});
     }
@@ -68,9 +68,10 @@ State Manager::locate(gguf::ExpertId id) const { std::lock_guard<std::mutex> l(i
 void Manager::request(gguf::ExpertId id, bool hot) {
     tick(); std::lock_guard<std::mutex> l(impl_->mutex); auto& e = impl_->at(id);
     if (e.slot && impl_->slots.ready(*e.slot)) { ++impl_->profile.counters.expert_hit; if (e.speculative) ++impl_->profile.counters.prefetch_used; }
-    else ++impl_->profile.counters.expert_miss;
+    else { ++impl_->profile.counters.expert_miss; impl_->missed.push_back(id); }
     impl_->schedule(id, hot, false);
 }
+std::vector<gguf::ExpertId> Manager::drain_misses() { std::lock_guard<std::mutex> l(impl_->mutex); std::vector<gguf::ExpertId> drained; drained.swap(impl_->missed); return drained; }
 void Manager::prefetch(gguf::ExpertId id, bool hot) { tick(); std::lock_guard<std::mutex> l(impl_->mutex); impl_->schedule(id, hot, true); }
 void Manager::cancel_prefetch() {
     impl_->transfers.cancel_prefetch(); std::lock_guard<std::mutex> l(impl_->mutex);

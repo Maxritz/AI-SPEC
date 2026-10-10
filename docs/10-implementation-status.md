@@ -23,6 +23,7 @@ from the model definition.
 | area | status | verification |
 |---|---|---|
 | GGUF reader and model index (Phase 1) | implemented | Verified (host): `substrate` |
+| Sharded GGUF (multi-file splits) | implemented | Implemented, unverified: `load_model_index` (`src/gguf/model_index.cpp`) merges the split directories, refuses a tensor name that repeats across splits, checks the split-count, split-number and total-tensor-count keys, builds a composite fingerprint over every split header, and reads each tensor's payload from the split file that lists it. No test or run has exercised the merge path, and every sharded file in the collection has an architecture outside the allow-list (`laguna`, `qwen4exp`), so none of them loads end to end |
 | Expert store v2: packing, manifest, journal, checksum repair, scrub, stale/foreign refusal | implemented | Verified (host): `store`; process-kill crash points run on POSIX only |
 | Lazy store: index-only open, streamed header parse, on-demand packing | implemented | Verified (host): `store`, `model` (eviction run) |
 | Quantisation compiler W2/3/4/6/8, g64/g128, calibration and quality gate | implemented | Verified (host): `compiler`. Quality on real models: not measured |
@@ -52,6 +53,27 @@ from the model definition.
 
 ## Known limitations that affect correctness claims
 
+- A GGUF file holding one tensor of an unsupported ggml type does not load: the file is
+  refused as a whole, never partly read with a guess. While the directory is read the
+  header parser accepts only the 15 standard types plus the I8/I16/I32/I64/F64 widths, so
+  every I-quant (IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S, IQ1_S, IQ1_M, IQ4_NL, IQ4_XS),
+  Q1_0, Q2_0 and any id at or above `GGML_TYPE_COUNT` (43) is rejected there;
+  `src/device/weight_decode.h` decodes exactly F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1,
+  Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K and Q8_K, and `tensor::dequantize` refuses the
+  integer and F64 widths when a payload is read rather than inventing a layout. Measured
+  across the 132 GGUF files in `G:\More-models` and `H:\OLLAMA-Models\GGUF`, 59,451
+  tensors carry a type id inside the pinned enum (0..42): 54,444 of them (91.6%) use a
+  supported type and 5,007 (8.4%) are refused, and a further 2,215 tensors carry ids above
+  `GGML_TYPE_COUNT`, which the pinned `ggml.h` does not define at all.
+- The sharded path in `load_model_index` keys on `general.split_count`,
+  `general.split_no` and `general.split_tensors_count`, and it requires every later split
+  to carry a `general.architecture` matching the first split. The sharded files measured
+  here (`Laguna-S-2.1-UD-Q4_K_M-00001..3-of-00003.gguf`,
+  `Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001..2-of-00002.gguf`) write the unprefixed
+  keys `split.count`, `split.no` and `split.tensors.count` — the spelling the pinned
+  llama.cpp loader reads — and only the first split carries `general.architecture`. For
+  those files the merge path is therefore not reached: the first split is read as a
+  complete model. This is recorded as unverified, not as working.
 - The synthetic model exercises the Qwen3-MoE schema only. Other architectures
   share code paths but have no reference comparison.
 - Speculation is verified for the MTP drafter and the DFlash family on synthetic
@@ -96,8 +118,13 @@ These are not implemented in this tree. The architecture allow-list refuses them
   per-family list.
 - **Laguna (including sharded GGUF files), `openai-moe` (gpt-oss: learned sinks,
   clamped SwiGLU), `llama4` (iRoPE), `gemma` family, `mixtral`, `dots1`,
-  `ernie4_5-moe`, `hunyuan-moe`, `granitemoe` and newer releases.** Sharded-model loading
-  (multi-file GGUF splits) is not implemented for any family.
+  `ernie4_5-moe`, `hunyuan-moe`, `granitemoe` and newer releases.** Multi-file GGUF
+  splits are parsed rather than ignored: the split directories are merged and each
+  tensor's payload is read from its own split file. The path is unverified — no test or
+  run has exercised it, and the sharded files measured (Laguna-S-2.1-UD-Q4_K_M,
+  Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS) both use architectures outside the allow-list,
+  so none of them loads end to end. The key spelling the merge path matches on is recorded
+  in the known limitations below.
 - **Other MoE families.** The pinned llama.cpp registers more MoE architectures than the
   six verified profiles. The ones not yet implemented (`openai-moe`, `llama4`, `mixtral`,
   `dots1`, `ernie4_5-moe`, `hunyuan-moe`, `granitemoe`, and newer releases) are listed in

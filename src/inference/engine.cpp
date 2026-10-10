@@ -60,6 +60,9 @@ Engine::Engine(const std::string& path, Config config, int device) : config_(std
         fallback_ = std::make_unique<compute::CpuFallback>(h2d_bytes_s_);
         executor_ = std::make_unique<compute::ExpertExecutor>(runtime_, *residency_, profile_, fallback_.get());
         predictor_ = std::make_unique<residency::Predictor>(spec_.total_layers, index_.geometry.n_expert, index_.geometry.n_expert_used, config_.adaptive_prefetch);
+        // Cache decisions follow the request-level activation trace while a
+        // forward pass is in flight, and the pool's own order outside one.
+        slots_->set_priority([this](gguf::ExpertId id) { return predictor_->cache_priority(id); });
     }
     tokenizer_ = std::make_unique<tokenizer::Tokenizer>(index_);
     require(tokenizer_->vocab_size() == spec_.vocabulary, "tokenizer and embedding vocabularies disagree");
@@ -144,6 +147,7 @@ std::shared_ptr<Generation> Engine::create_session(std::vector<int32_t> prompt, 
         }
     }
     if (predictor_) { predictor_->request_boundary(); }
+    if (index_.has_experts()) { g->activation.configure(spec_.total_layers, index_.geometry.n_expert); }
     return g;
 }
 std::vector<double> Engine::score(const std::vector<int32_t>& tokens, uint32_t chunk) {
@@ -161,7 +165,7 @@ std::vector<double> Engine::score(const std::vector<int32_t>& tokens, uint32_t c
     for (uint32_t start = 0; start < tokens.size();) {
         const uint32_t count = std::min<uint32_t>(step, uint32_t(tokens.size()) - start);
         std::vector<int32_t> part(tokens.begin() + start, tokens.begin() + start + count);
-        auto result = model_->forward(*g->kv, *cache_, *attention_, part, true, never, {}, model_->has_recurrent() ? &g->recurrent : nullptr);
+        auto result = model_->forward(*g->kv, *cache_, *attention_, part, true, never, {}, model_->has_recurrent() ? &g->recurrent : nullptr, &g->activation);
         for (uint32_t j = 0; j < count && start + j + 1 < tokens.size(); ++j) {
             const float* row = result.logits.data() + uint64_t(j) * V;
             double maximum = row[0];
@@ -277,7 +281,7 @@ std::vector<int32_t> Engine::step(Generation& g) {
             // accepted prefix (the recurrent state has no per-token undo, unlike the KV cache).
             std::optional<model::RecurrentState> recurrent_snapshot;
             if (model_->has_recurrent()) { recurrent_snapshot = model_->clone_recurrent_state(g.recurrent); }
-            auto result = model_->forward(*g.kv, *cache_, *attention_, draft, true, cancelled, {}, &g.recurrent);
+            auto result = model_->forward(*g.kv, *cache_, *attention_, draft, true, cancelled, {}, &g.recurrent, &g.activation);
             remember(g, start, result);
             auto verification = spec::verify(draft, g.logits, result.logits, g.sampler, g.history, g.options.max_new_tokens - uint32_t(g.output.size()));
             require(!verification.accepted.empty(), "coupled root did not match its own preview");
@@ -291,7 +295,7 @@ std::vector<int32_t> Engine::step(Generation& g) {
             g.kv->truncate(replay ? start : start + accepted); forget_from(g, start + accepted);
             if (replay) {
                 model_->restore_recurrent_state(g.recurrent, *recurrent_snapshot);
-                model_->forward(*g.kv, *cache_, *attention_, verification.accepted, false, cancelled, {}, &g.recurrent);
+                model_->forward(*g.kv, *cache_, *attention_, verification.accepted, false, cancelled, {}, &g.recurrent, &g.activation);
             }
             // Drafted MTP entries used chained hiddens; the canonical entries are re-derived by sync_mtp.
             g.mtp_kv->truncate(head_start);
@@ -303,7 +307,7 @@ std::vector<int32_t> Engine::step(Generation& g) {
                 emit(g, *verification.replacement);
                 if (!g.done) {
                     uint32_t next_start = g.kv->size();
-                    auto replacement = model_->forward(*g.kv, *cache_, *attention_, {*verification.replacement}, false, cancelled, {}, &g.recurrent);
+                    auto replacement = model_->forward(*g.kv, *cache_, *attention_, {*verification.replacement}, false, cancelled, {}, &g.recurrent, &g.activation);
                     g.hidden = replacement.hidden; g.logits = replacement.logits; remember(g, next_start, replacement); index_result(g, next_start, replacement);
                 }
             }
@@ -317,13 +321,16 @@ std::vector<int32_t> Engine::step(Generation& g) {
         if (residency_) { residency_->cancel_prefetch(); }
         throw;
     }
+    // The finished request joins the collection of recent request matrices, so
+    // the next request with a similar activation pattern can be prefetched from it.
+    if (g.done && predictor_) { predictor_->offer_activation(g.activation); }
     return {g.output.begin() + before, g.output.end()};
 }
 model::Result Engine::forward_target(Generation& g, const std::vector<int32_t>& tokens, bool all, const std::function<bool()>& cancelled) {
     const uint32_t start = g.kv->size();
     std::vector<uint32_t> capture;
     if (g.dflash_kv) { capture = drafter_->spec().target_layers; }
-    auto result = model_->forward(*g.kv, *cache_, *attention_, tokens, all, cancelled, capture, model_->has_recurrent() ? &g.recurrent : nullptr);
+    auto result = model_->forward(*g.kv, *cache_, *attention_, tokens, all, cancelled, capture, model_->has_recurrent() ? &g.recurrent : nullptr, &g.activation);
     if (g.dflash_kv) {
         // Features are the target layer inputs in target_layers order, one row per position.
         require(g.dflash_kv->size() == start, "DFlash drafter cache is not aligned with the target sequence");
@@ -424,7 +431,7 @@ std::shared_ptr<Generation> Engine::resume(const std::string& path, uint32_t cou
     g->sampler.restore(state.at("sampling")); g->history = history; g->prompt = history; g->prefilled = g->kv->size();
     g->hidden = state.at("last_hidden").get<std::vector<float>>();
     if (g->prefilled < history.size()) {
-        auto result = model_->forward(*g->kv, *cache_, *attention_, {history.begin() + g->prefilled, history.end()}, false, {}, {}, &g->recurrent);
+        auto result = model_->forward(*g->kv, *cache_, *attention_, {history.begin() + g->prefilled, history.end()}, false, {}, {}, &g->recurrent, &g->activation);
         g->hidden.assign(result.hidden.end() - spec_.hidden, result.hidden.end()); g->logits = std::move(result.logits); g->prefilled = uint32_t(history.size());
     } else {
         g->logits = model_->logits(g->hidden);
@@ -448,7 +455,7 @@ nlohmann::json Engine::report() const {
         result["io"] = {{"backend", io.backend}, {"native", io.native}, {"queue_depth", io.queue_depth}, {"detail", io.detail}};
     }
     if (drafter_) { result["drafter"] = {{"flavor", dflash::flavor_name(drafter_->spec().flavor)}, {"block_size", drafter_->spec().block_size}, {"draft_max", drafter_max_}, {"target_layers", drafter_->spec().target_layers}, {"host_bytes", drafter_->host_bytes()}}; }
-    if (predictor_) { auto p = predictor_->stats(); result["prediction"] = {{"predicted", p.predicted}, {"used", p.used}, {"late", p.late}, {"wasted_bytes", p.wasted_bytes}, {"hit_rate", p.hit_rate()}, {"horizon", predictor_->horizon()}}; }
+    if (predictor_) { auto p = predictor_->stats(); result["prediction"] = {{"predicted", p.predicted}, {"used", p.used}, {"late", p.late}, {"wasted_bytes", p.wasted_bytes}, {"hit_rate", p.hit_rate()}, {"horizon", predictor_->horizon()}, {"traced_requests", predictor_->collection_size()}, {"trace_capacity", predictor_->collection_capacity()}}; }
     result["classification"] = config_.force_cold && store_ ? "storage-bound" : backend_->caps().is_gpu ? "native-gpu" : "host-reference";
     return result;
 }

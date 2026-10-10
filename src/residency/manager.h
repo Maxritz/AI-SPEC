@@ -19,6 +19,9 @@ public:
     State locate(gguf::ExpertId) const;
     void request(gguf::ExpertId, bool hot = true);
     void prefetch(gguf::ExpertId, bool hot = true);
+    // Experts demanded since the last drain that were not resident on arrival.
+    // An unfilled prefetch is re-queued at the front of the next pass.
+    std::vector<gguf::ExpertId> drain_misses();
     void cancel_prefetch();
     void tick();
     bool ready(gguf::ExpertId) const;

@@ -201,19 +201,28 @@ std::string Model::ffn_norm_name(const std::string& prefix) const {
     if (has(prefix + alias)) return prefix + alias;
     return prefix + primary;  // tensor() reports the missing primary name
 }
-Result Model::forward(kv::Session& session, kv::Cache& cache, attn::Attention& attn, const std::vector<int32_t>& tokens, bool all, const std::function<bool()>& cancel, const std::vector<uint32_t>& capture, RecurrentState* recurrent) { return run(session, cache, attn, tokens, all, cancel, capture, 0, spec_.layers, nullptr, recurrent); }
-Result Model::mtp(kv::Session& session, kv::Cache& cache, attn::Attention& attn, const std::vector<int32_t>& tokens, const std::vector<float>& hidden, const std::function<bool()>& cancel) {
+Result Model::forward(kv::Session& session, kv::Cache& cache, attn::Attention& attn, const std::vector<int32_t>& tokens, bool all, const std::function<bool()>& cancel, const std::vector<uint32_t>& capture, RecurrentState* recurrent, residency::ActivationTrace* activation) { return run(session, cache, attn, tokens, all, cancel, capture, 0, spec_.layers, nullptr, recurrent, activation); }
+Result Model::mtp(kv::Session& session, kv::Cache& cache, attn::Attention& attn, const std::vector<int32_t>& tokens, const std::vector<float>& hidden, const std::function<bool()>& cancel, residency::ActivationTrace* activation) {
     require(spec_.mtp_layers && !tokens.empty() && hidden.size() == tokens.size() * spec_.hidden, "MTP requires resident nextn tensors and one target hidden row per token");
     // Spec::parse rejects recurrent flags on MTP blocks, so the MTP pass needs no recurrent state.
-    return run(session, cache, attn, tokens, false, cancel, {}, spec_.layers, spec_.total_layers, &hidden, nullptr);
+    return run(session, cache, attn, tokens, false, cancel, {}, spec_.layers, spec_.total_layers, &hidden, nullptr, activation);
 }
-Result Model::run(kv::Session& session, kv::Cache& cache, attn::Attention& attn, const std::vector<int32_t>& tokens, bool all, const std::function<bool()>& cancel, const std::vector<uint32_t>& capture, uint32_t first, uint32_t end, const std::vector<float>* seed, RecurrentState* recurrent) {
+Result Model::run(kv::Session& session, kv::Cache& cache, attn::Attention& attn, const std::vector<int32_t>& tokens, bool all, const std::function<bool()>& cancel, const std::vector<uint32_t>& capture, uint32_t first, uint32_t end, const std::vector<float>* seed, RecurrentState* recurrent, residency::ActivationTrace* activation) {
     using namespace compute; require(!tokens.empty() && tokens.size() <= max_batch_, "forward batch outside reserved workspace"); for (auto token : tokens) require(token >= 0 && uint32_t(token) < spec_.vocabulary, "input token outside vocabulary");
     // Only passes that touch recurrent blocks need the per-session state; the MTP (NextN) pass
     // runs the trailing full-attention blocks and is seeded from the target's hidden states.
     bool needs_recurrent = false;
     for (uint32_t l = first; l < end; ++l) needs_recurrent = needs_recurrent || spec_.recurrent[l] != 0;
     if (needs_recurrent) require(recurrent && recurrent->conv.size() == spec_.total_layers && recurrent->ssm.size() == spec_.total_layers, "recurrent model forward requires a per-session recurrent state");
+    // Expert activation tracing needs a model with experts. For a dense model
+    // the request context is inert and the model-level predictor keeps the
+    // history it already had.
+    if (activation && !(index_.has_experts() && index_.geometry.n_expert)) { activation = nullptr; }
+    // The request trace is bound for exactly this pass: the slot pool's cache
+    // judge reads it, so it must be unbound on every exit path, throws included.
+    if (predictor_) { predictor_->bind_activation(activation); }
+    struct TraceScope { residency::Predictor* predictor; ~TraceScope() { if (predictor) { predictor->bind_activation(nullptr); } } } trace_scope{predictor_};
+    if (activation) { activation->configure(spec_.total_layers, index_.geometry.n_expert); }
     uint32_t n = uint32_t(tokens.size()), start = session.size(), h = spec_.hidden, qwidth = spec_.heads * spec_.key_dim, kwidth = spec_.kv_heads * spec_.key_dim, vwidth = spec_.kv_heads * spec_.value_dim, ff = spec_.max_intermediate;
     session.extend(start + n); Frame frame{workspace_}; auto floats = [&](uint64_t count) { return frame.take(count * 4); };
     auto x = floats(uint64_t(n) * h), y = floats(uint64_t(n) * h), normed = floats(uint64_t(n) * h), q = floats(uint64_t(n) * qwidth), k = floats(uint64_t(n) * kwidth), v = floats(uint64_t(n) * vwidth), a = floats(uint64_t(n) * spec_.heads * spec_.value_dim), mix = floats(uint64_t(n) * h), ffnout = floats(uint64_t(n) * h), shared = floats(uint64_t(n) * h), gate = floats(uint64_t(n) * ff), up = floats(uint64_t(n) * ff), activated = floats(uint64_t(n) * ff);
@@ -263,7 +272,16 @@ Result Model::run(kv::Session& session, kv::Cache& cache, attn::Attention& attn,
             result.captured[layer].assign(host.as<float>(), host.as<float>() + uint64_t(n) * h);
         }
         auto prefix = "blk." + std::to_string(layer) + ".";
-        if (predictor_ && residency_) { auto pred = predictor_->predict(layer, 3); for (auto id : pred.candidates) if (id.layer < end && index_.find_tensor_info("blk." + std::to_string(id.layer) + ".ffn_gate_exps.weight")) residency_->prefetch(id, false); }
+        if (predictor_ && residency_) {
+            auto pred = activation ? predictor_->predict_activated(layer) : predictor_->predict(layer, 3);
+            std::vector<gguf::ExpertId> asked;
+            for (auto id : pred.candidates) {
+                if (id.layer >= end || id.layer < first || !index_.find_tensor_info("blk." + std::to_string(id.layer) + ".ffn_gate_exps.weight")) continue;
+                residency_->prefetch(id, false);
+                asked.push_back(id);
+            }
+            if (activation) { activation->predict(asked); }
+        }
         last = norm(x, normed, prefix + "attn_norm.weight", n, h, last, layer); Ticket qdone, kdone, gate_done;
         if (spec_.recurrent[layer] && !seed) {
             // Gated DeltaNet (linear attention): joint QKV mix, causal depthwise conv over the conv
@@ -353,8 +371,12 @@ Result Model::run(kv::Session& session, kv::Cache& cache, attn::Attention& attn,
             std::vector<uint32_t> ids(host_ids.as<uint32_t>(), host_ids.as<uint32_t>() + routes); std::vector<float> weights(host_weights.as<float>(), host_weights.as<float>() + routes);
             for (auto id : ids) { union_ids.insert((uint64_t(layer) << 32) | id); }
             if (predictor_) predictor_->observe(layer, ids);
+            if (activation) { activation->accumulate(layer, ids); activation->declare_unused(layer, ids); }
             const gguf::ExpertLayer* el = nullptr; for (const auto& candidate : index_.experts) if (candidate.layer == layer) el = &candidate; require(el, "missing MoE directory layer"); uint32_t intermediate = uint32_t(index_.tensors[el->tensors[0].tensor_index].dims[1]);
             last = experts_->run(layer, normed, ids, weights, n, p.top_k, h, intermediate, ffnout, spec_.activation, cancel);
+            // A demanded expert that was not resident is an unfilled prefetch:
+            // it jumps the queue on the next pass, across this request's iterations.
+            if (activation && residency_) for (auto id : residency_->drain_misses()) activation->note_miss(id);
             if (has(prefix + "ffn_up_shexp.weight")) {
                 auto shared_done = dense_ffn("_shexp", shared, last);
                 if (has(prefix + "ffn_gate_inp_shexp.weight")) { shared_done = mat(prefix + "ffn_gate_inp_shexp.weight", normed, extra, n, shared_done, profile::OpClass::Projection, layer); shared_done = rearrange({extra.as<float>(), extra2.as<float>(), n, h, 1, 1, 0, h, 1}, shared_done, layer); shared_done = submit(profile::OpClass::FFNAct, ActivationPlan{extra2.as<float>(), shared.as<float>(), shared.as<float>(), uint64_t(n) * h, Activation::Sigmoid}, &device::Backend::activation, {shared_done}, layer, "shared-expert-gate-v1", runtime_.compute_stream()); }
@@ -365,6 +387,7 @@ Result Model::run(kv::Session& session, kv::Cache& cache, attn::Attention& attn,
 
         runtime_.poll();
     }
+    if (activation) { activation->fold(); }  // this iteration joins the request's own reuse history
     if (recurrent) recurrent->tokens = start + n;  // one scan step per token, shared by every recurrent layer
     auto hidden_host = runtime_.backend().allocate(uint64_t(n) * h * 4, device::MemoryKind::Pageable); auto hidden_copy = runtime_.copy(hidden_host, x, device::CopyKind::D2H, {last});
     std::string head_norm = "output_norm.weight", head = has("output.weight") ? "output.weight" : "token_embd.weight";

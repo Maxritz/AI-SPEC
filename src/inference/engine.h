@@ -4,6 +4,7 @@
 #include "io/reader.h"
 #include "kv/radix.h"
 #include "model/model.h"
+#include "residency/activation.h"
 #include "spec/controller.h"
 #include "spec/dflash.h"
 #include "tokenizer/tokenizer.h"
@@ -24,6 +25,10 @@ struct Generation {
     // pure-attention models; prefix reuse is disabled for recurrent models because the
     // recurrent state cannot be rebuilt from KV pages (docs/02 C12 replay-suffix rule).
     model::RecurrentState recurrent;
+    // Request-level expert activation trace (MoE-Infinity 4). Per request, never shared:
+    // the iteration matrix of the forward pass in flight plus the request matrix it folds
+    // into, which is what expert prefetch and cache decisions follow.
+    residency::ActivationTrace activation;
     // Target hidden state of every recently committed position (position -> row).
     // The MTP drafter's cache is always re-derived from these canonical rows.
     std::map<uint32_t, std::vector<float>> recent;

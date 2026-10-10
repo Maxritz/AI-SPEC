@@ -4,6 +4,7 @@
 #include "core/autotuner.h"
 #include "core/config.h"
 #include "gguf/model_index.h"
+#include "residency/activation.h"
 #include "residency/predictor.h"
 #include <map>
 namespace knj::model {
@@ -54,7 +55,8 @@ public:
     bool has(const std::string&) const;
     uint64_t loaded_bytes() const { return loaded_bytes_; }
     Result forward(kv::Session&, kv::Cache&, attn::Attention&, const std::vector<int32_t>&, bool all_logits = false,
-                   const std::function<bool()>& cancelled = {}, const std::vector<uint32_t>& capture_layers = {}, RecurrentState* recurrent = nullptr);
+                   const std::function<bool()>& cancelled = {}, const std::vector<uint32_t>& capture_layers = {}, RecurrentState* recurrent = nullptr,
+                   residency::ActivationTrace* activation = nullptr);
     bool has_recurrent() const { return spec_.recurrent_any; }
     RecurrentState new_recurrent_state() const;
     RecurrentState clone_recurrent_state(const RecurrentState&) const;
@@ -66,7 +68,7 @@ public:
     // without any normalisation; used by the DFlash/DSpark drafter, which owns its own norms.
     std::vector<float> embed_rows(const std::vector<int32_t>& tokens);
     std::vector<float> head_rows(const std::vector<float>& hidden);
-    Result mtp(kv::Session&, kv::Cache&, attn::Attention&, const std::vector<int32_t>& tokens, const std::vector<float>& target_hidden_rows, const std::function<bool()>& cancelled = {});
+    Result mtp(kv::Session&, kv::Cache&, attn::Attention&, const std::vector<int32_t>& tokens, const std::vector<float>& target_hidden_rows, const std::function<bool()>& cancelled = {}, residency::ActivationTrace* activation = nullptr);
     void tune(Autotuner&, bool allow_wmma);
 private:
     const gguf::ModelIndex& index_; Spec spec_; Runtime& runtime_; transfer::Engine& transfers_; profile::Profiler& profile_;
@@ -77,6 +79,6 @@ private:
     uint64_t scratch_width() const;  // widest per-token scratch row (shared by frame_bytes and run)
     std::string ffn_norm_name(const std::string& layer_prefix) const;
     Result run(kv::Session&, kv::Cache&, attn::Attention&, const std::vector<int32_t>&, bool, const std::function<bool()>&,
-               const std::vector<uint32_t>&, uint32_t first, uint32_t end, const std::vector<float>* seed, RecurrentState* recurrent);
+               const std::vector<uint32_t>&, uint32_t first, uint32_t end, const std::vector<float>* seed, RecurrentState* recurrent, residency::ActivationTrace* activation);
 };
 }  // namespace knj::model

@@ -8,7 +8,9 @@ refused with `Unsupported`.
 Sources:
 - Pinned llama.cpp `08246a28f6000100433d297c4e037c02e9d2d464`, vendored subset under
   `third_party/llama/` (`src/llama-arch.cpp` for names, `src/models/<arch>.cpp` for graphs
-  and tensor layouts). The full pinned archive is in `.cache/llama.tar.gz`.
+  and tensor layouts). The pinned revision is recorded in
+  `third_party/llama/UPSTREAM_REVISION` (`08246a28f6000100433d297c4e037c02e9d2d464`);
+  the full archive is not committed to the repository.
 - Hugging Face `transformers` 5.19.0 modelling files, read for the reference semantics of
   `minimax_m2`, `glm4_moe` and `olmoe`.
 - Hugging Face `config.json` files for `MiniMaxAI/MiniMax-M2`, `zai-org/GLM-4.5-Air` and
@@ -89,6 +91,12 @@ decoder with hand-computed known-answer blocks for every type (including the Q5_
 check per type. The reader refuses a quantized tensor whose innermost (row) dimension is
 not a whole number of blocks, matching the canonical gguf parser. Group-quant types are
 engine-internal (expert store, KV codec, compiler packing) and are not GGUF file types.
+
+The 15-type claim covers the standard ggml set only. Every I-quant (IQ2_XXS, IQ2_XS,
+IQ3_XXS, IQ3_S, IQ2_S, IQ1_S, IQ1_M, IQ4_NL, IQ4_XS), Q1_0, Q2_0 and any type the pinned
+`ggml.h` does not define sit outside it, and a file holding one tensor of such a type is
+refused rather than loaded with a guessed layout. `docs/10-implementation-status.md`
+records the measured split over the reference collection.
 
 ## Also implemented, not in the family suite
 
