@@ -26,7 +26,7 @@ void Profiler::record(OpRecord r) {
     previous_end_[r.stream] = r.dev_end_ns;
     if (steps_ < warmup_) return;
     auto& a = accumulated_[size_t(r.cls)]; ++a.ops; a.host += (r.host_end_ns - r.host_begin_ns) / 1000.0;
-    if (mode_ == Mode::Full) { double busy = (r.dev_end_ns - r.dev_start_ns) / 1000.0; if (r.is_device) { a.dev += busy; a.idle += idle; } else a.worker += busy; records_.push_back(std::move(r)); }
+    if (mode_ == Mode::Full) { double busy = (r.dev_end_ns - r.dev_start_ns) / 1000.0; if (r.is_device) { a.dev += busy; a.idle += idle; } else a.worker += busy; if (records_.size() < 262144) records_.push_back(std::move(r)); else ++records_dropped_; }
 }
 void Profiler::floor(double h, double d, double w, uint32_t n) { std::lock_guard<std::mutex> l(mutex_); floor_host_ = h; floor_device_ = d; floor_worker_ = w; floor_samples_ = n; }
 void Profiler::step(double latency, uint64_t tokens) { std::lock_guard<std::mutex> l(mutex_); if (steps_ >= warmup_) { latencies_.push_back(latency); tokens_ += tokens; } ++steps_; }
@@ -49,6 +49,9 @@ nlohmann::json Profiler::report() const {
     auto lat = latencies_; std::sort(lat.begin(), lat.end());
     auto percentile = [&](double p) { return lat.empty() ? 0.0 : lat[std::min(lat.size() - 1, size_t(std::ceil(p * lat.size()) - 1))]; };
     j["latency"] = {{"samples", lat.size()}, {"unit", "us_per_step"}, {"p50", percentile(0.50)}, {"p95", percentile(0.95)}, {"p99", percentile(0.99)}};
+    j["ops"] = nlohmann::json::array();
+    for (const auto& r : records_) j["ops"].push_back({{"component", op_name(r.cls)}, {"kernel", r.kernel}, {"layer", r.layer}, {"stream", r.stream}, {"device", r.is_device}, {"dev_us", (r.dev_end_ns - r.dev_start_ns) / 1000.0}, {"host_us", (r.host_end_ns - r.host_begin_ns) / 1000.0}});
+    if (records_dropped_) j["ops_dropped"] = records_dropped_;
     auto c = counters.snapshot();
     j["counters"] = {{"h2d_bytes", c.h2d}, {"d2h_bytes", c.d2h}, {"nvme_read_bytes", c.nvme_read}, {"nvme_write_bytes", c.nvme_write}, {"expert_hit", c.expert_hit}, {"expert_miss", c.expert_miss}, {"prefetch_used", c.prefetch_used}, {"prefetch_waste_bytes", c.prefetch_waste}, {"cpu_fallback", c.cpu_fallback}, {"cpu_fallback_us", c.cpu_fallback_us}, {"slot_evictions", c.slot_evictions}, {"kv_reload", c.kv_reload}, {"kv_recompute", c.kv_recompute}, {"prefix_tokens", c.prefix_tokens}, {"full_fences", c.full_fences}, {"peak_pinned_bytes", c.peak_pinned}, {"cancelled", c.cancelled}, {"stall_us", c.stall_us}};
     j["transitions"] = transitions_; return j;
@@ -56,7 +59,7 @@ nlohmann::json Profiler::report() const {
 std::string Profiler::table() const {
     auto j = report(); std::ostringstream s;
     s << "  kanjoos 0.2.0   " << j.value("device", "unreported") << "\n";
-    s << "                 backend " << j.value("backend", "unreported") << "   residency " << j.value("residency", "unreported") << "\n";
+    s << "                 arch " << j.value("architecture", "unreported") << "   driver " << j.value("driver", "unreported") << "   gpu_timing " << (j.value("gpu_timing_available", false) ? "yes" : "no") << "\n";
     s << "     component           ops   %dev      dev us     idle us     host us\n";
     auto rows = j["components"].get<std::vector<nlohmann::json>>();
     std::stable_sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a["dev_us"].template get<double>() > b["dev_us"].template get<double>(); });

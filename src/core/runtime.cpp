@@ -30,7 +30,7 @@ void Runtime::poll() {
     std::lock_guard<std::mutex> l(mutex_);
     for (auto it = pending_.begin(); it != pending_.end();) {
         if (!it->completion->ready()) { ++it; continue; }
-        it->completion->wait(); it->record.dev_start_ns = it->start->timestamp_ns(); it->record.dev_end_ns = it->completion->event->timestamp_ns(); if (!it->op.calibration) profile_.record(std::move(it->record)); it = pending_.erase(it);
+        it->completion->wait(); it->record.dev_start_ns = it->start->timestamp_ns(); const double pair_us = backend_->event_pair_us(it->start, it->completion->event); it->record.dev_end_ns = it->record.dev_start_ns + (pair_us > 0.0 ? uint64_t(pair_us * 1000.0) : 0); if (!it->op.calibration) profile_.record(std::move(it->record)); it = pending_.erase(it);
     }
 }
 void Runtime::submit_all() {
@@ -46,7 +46,7 @@ void Runtime::measure_floor(uint32_t n) {
     // markers, dispatcher and retirement. Only aggregate accounting is skipped.
     for (uint32_t i = 0; i < n; ++i) {
         uint64_t begin = platform::now_ns(); auto t = submit({profile::OpClass::Spec, compute_, [](device::Backend& b, auto s) { b.empty(s); }, {}, {}, 0, "profile-floor-v1", true}); uint64_t finish = platform::now_ns();
-        t->wait(); host += (finish - begin) / 1000.0; busy += (t->event->timestamp_ns() - t->start->timestamp_ns()) / 1000.0; poll();
+        t->wait(); host += (finish - begin) / 1000.0; busy += std::max(0.0, backend_->event_pair_us(t->start, t->event)); poll();
     }
     profile_.floor(host / n, backend_->caps().is_gpu ? busy / n : 0, backend_->caps().is_gpu ? 0 : busy / n, n);
 }

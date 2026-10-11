@@ -66,7 +66,7 @@ Engine::Engine(const std::string& path, Config config, int device) : config_(std
     }
     tokenizer_ = std::make_unique<tokenizer::Tokenizer>(index_);
     require(tokenizer_->vocab_size() == spec_.vocabulary, "tokenizer and embedding vocabularies disagree");
-    model_ = std::make_unique<model::Model>(index_, spec_, runtime_, *transfers_, profile_, budget_.workspace, config_.prefill_chunk, executor_.get(), residency_.get(), predictor_.get());
+    model_ = std::make_unique<model::Model>(index_, spec_, runtime_, *transfers_, budget_.workspace, config_.prefill_chunk, executor_.get(), residency_.get(), predictor_.get());
     if (!config_.drafter_path.empty()) {
         drafter_ = std::make_unique<dflash::Drafter>(gguf::load_model_index(config_.drafter_path), spec_);
         const auto& d = drafter_->spec();
@@ -78,7 +78,7 @@ Engine::Engine(const std::string& path, Config config, int device) : config_(std
         require(drafter_max_ >= 1, "the drafter's trained block leaves no room for drafts");
     }
     tuner_ = std::make_unique<Autotuner>(config_.tune_dir, backend_->caps().gcn_arch, backend_->caps().driver, platform::executable_hash(), "knj-abi-1");
-    model_->tune(*tuner_, config_.wmma);
+    model_->tune(*tuner_, config_.matmul, config_.wmma);
     kv::Identity identity{index_.fingerprint, backend_->caps().gcn_arch, tokenizer_->identity(), spec_.rope_identity};
     identity.codec = codec(config_.kv_codec); identity.block_tokens = budget_.token_block; identity.layer_slab = std::min(budget_.layer_slab, spec_.kv_layers);
     uint64_t mtp_hot = spec_.mtp_layers ? align_up(budget_.hot_kv * spec_.mtp_layers / spec_.total_layers, 256) : 0;

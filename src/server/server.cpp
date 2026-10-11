@@ -199,7 +199,7 @@ struct ApiServer::Impl {
     // Runs one generation to completion while holding the engine lock per step.
     json run_to_completion(const std::string& id, const std::shared_ptr<inference::Generation>& g) {
         register_request(id, g);
-        for (uint64_t guard = 0; !g->done; ++guard) {
+        while (!g->done) {
             std::lock_guard<std::mutex> l(engine_mutex);
             engine.step(*g);
         }

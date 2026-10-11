@@ -81,6 +81,124 @@ __global__ void matmul_wmma(MatmulPlan p) {
     for (uint32_t j = 0; j < 8; ++j) { uint32_t row = blockIdx.x * 16 + (lane / 16) * 8 + j, token = blockIdx.y * 16 + lane % 16; if (row < p.weight.rows && token < p.tokens) p.output[uint64_t(token) * p.weight.rows + row] = dot(p.weight, row, p.input + uint64_t(token) * p.weight.cols, false) + (p.bias ? p.bias[row] : 0); }
 #endif
 }
+// E1: sub-block constant hoist for matmul_staged. ab() fills (A, M) for
+// sub-block `s` exactly as weight_in_block would compute them; v() then
+// reproduces that case's tail expression A*float(q)-M / A*float(q)+M /
+// A*float(q-...) so the compiler sees the identical FMA-contraction pattern.
+// Types without a hoist fall back to weight_in_block (still div/mod-free).
+__device__ inline bool stage_ab(uint32_t t, const uint8_t* p, uint32_t s, float& A, float& M) {
+    switch (t) {
+        case 2: case 3: case 6: case 7: case 8: case 9: A = decode::half(decode::u16(p)); M = 0; return true;
+        case 15: A = decode::from_bits(decode::u32(p)); M = 0; return true;
+        case 30: case 0: case 1: A = 0; M = 0; return false;
+        case 10: A = decode::half(decode::u16(p + 80)) * float(p[s] & 15); M = decode::half(decode::u16(p + 82)) * float(p[s] >> 4); return true;
+        case 11: { const uint8_t* d = p + 96; int sc = int(((d[s % 8] >> (s / 8 * 4)) & 15) | (((d[8 + s % 4] >> (s / 4 * 2)) & 3) << 4)) - 32; A = decode::half(decode::u16(p + 108)) * float(sc); M = 0; return true; }
+        case 12: case 13: { const uint8_t* h = p + 4; uint32_t sc, mn; if (s < 4) { sc = h[s] & 63; mn = h[s + 4] & 63; } else { sc = (h[s + 4] & 15) | ((h[s - 4] >> 6) << 4); mn = (h[s + 4] >> 4) | ((h[s] >> 6) << 4); } A = decode::half(decode::u16(p)) * float(sc); M = decode::half(decode::u16(p + 2)) * float(mn); return true; }
+        case 14: A = decode::half(decode::u16(p + 208)) * float(int8_t(p[192 + s])); M = 0; return true;
+        default:
+            if (t & decode::kGroupTag) { A = decode::half(decode::u16(p)); M = 0; return true; }
+            A = 0; M = 0; return false;
+    }
+}
+__device__ inline uint32_t stage_sub_stride(uint32_t t) {
+    if (t & decode::kGroupTag) return decode::block_elements(t);
+    switch (t) { case 10: case 11: case 14: return 16; case 12: case 13: return 32; case 0: case 1: case 30: return 1; default: return 32; }
+}
+__device__ inline bool stage_val(uint32_t t, const uint8_t* p, uint32_t i, float A, float& out) {
+    switch (t) {
+        case 2: out = A * float(int((p[2 + i % 16] >> (i / 16 * 4)) & 15) - 8); return true;
+        case 3: out = A * float((p[4 + i % 16] >> (i / 16 * 4)) & 15); return true;  // + M added by caller (M=p+2 half)
+        case 6: out = A * float((int((p[6 + i % 16] >> (i / 16 * 4)) & 15) | int(((decode::u32(p + 2) >> i) & 1) << 4)) - 16); return true;
+        case 7: out = A * float(int((p[8 + i % 16] >> (i / 16 * 4)) & 15) | int(((decode::u32(p + 4) >> i) & 1) << 4)); return true;
+        case 8: out = A * float(int8_t(p[2 + i])); return true;
+        case 9: out = A * float(int8_t(p[4 + i])); return true;
+        case 10: case 11: { uint32_t q; if (t == 10) q = (p[16 + (i / 128) * 32 + i % 32] >> ((i % 128) / 32 * 2)) & 3; else { q = (p[32 + (i / 128) * 32 + i % 32] >> ((i % 128) / 32 * 2)) & 3; q -= (p[i % 32] & (1u << (i / 32))) ? 0 : 4; } out = A * float(q); return true; }
+        case 12: case 13: { uint32_t q = (p[(t == 12 ? 16 : 48) + (i / 64) * 32 + i % 32] >> ((i % 64) / 32 * 4)) & 15; if (t == 13 && (p[16 + i % 32] & (1u << (i / 32)))) q += 16; out = A * float(q); return true; }
+        case 14: { uint32_t n = i / 128, j = i % 128; int q = int((p[n * 64 + j % 64] >> (j / 64 * 4)) & 15) | int(((p[128 + n * 32 + j % 32] >> (j / 32 * 2)) & 3) << 4); out = A * float(q - 32); return true; }
+        case 15: out = A * float(int8_t(p[4 + i])); return true;
+        default:
+            if (t & decode::kGroupTag) { out = A * float(int(decode::code(p + 3, i, t & 255)) - int(p[2])); return true; }
+            return false;
+    }
+}
+__device__ inline float stage_additive(uint32_t t, const uint8_t* p) {
+    if (t == 3) return decode::half(decode::u16(p + 2));
+    if (t == 7) return decode::half(decode::u16(p + 2));
+    return 0;
+}
+__device__ inline bool stage_subtractive(uint32_t t) { return t == 10 || t == 12 || t == 13; }
+template<uint32_t T>
+__global__ void matmul_gemv_t(MatmulPlan p) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= p.weight.rows) return;
+    const float* x = p.input;
+    const uint32_t cols = p.weight.cols;
+    const uint8_t* w = p.weight.data;
+    float acc = 0;
+    if (T == 12 || T == 13) {
+        constexpr uint32_t bb = T == 12 ? 144 : 176, qoff = T == 12 ? 16 : 48;
+        const uint8_t* wp = w; float d = 0, dm = 0, a[8] = {}, m[8] = {};
+        for (uint32_t k = 0; k < cols; ++k) {
+            const uint32_t i = k & 255, s = i >> 5, j = i & 31;
+            if (i == 0) { wp = w + (uint64_t(row) * cols + k) / 256 * bb; d = decode::half(decode::u16(wp)); dm = decode::half(decode::u16(wp + 2)); }
+            if (j == 0) {
+                const uint8_t* h = wp + 4; uint32_t sc, mn;
+                if (s < 4) { sc = h[s] & 63; mn = h[s + 4] & 63; } else { sc = (h[s + 4] & 15) | ((h[s - 4] >> 6) << 4); mn = (h[s + 4] >> 4) | ((h[s] >> 6) << 4); }
+                a[s] = d * float(sc); m[s] = dm * float(mn);
+            }
+            uint32_t q = (wp[qoff + (i >> 6) * 32 + j] >> (((i & 63) >> 5) * 4)) & 15;
+            if (T == 13 && (wp[16 + j] & (1u << s))) q += 16;
+            acc += x[k] * (a[s] * float(q) - m[s]);
+        }
+    } else if (T == 14) {
+        const uint8_t* wp = w; float d = 0, a16 = 0;
+        for (uint32_t k = 0; k < cols; ++k) {
+            const uint32_t i = k & 255;
+            if (i == 0) { wp = w + (uint64_t(row) * cols + k) / 256 * 210; d = decode::half(decode::u16(wp + 208)); }
+            if ((i & 15) == 0) a16 = d * float(int8_t(wp[192 + (i >> 4)]));
+            const uint32_t n = i >> 7, jj = i & 127;
+            int q = int((wp[n * 64 + (jj & 63)] >> (((jj >> 6) & 1) * 4)) & 15) | int(((wp[128 + n * 32 + (jj & 31)] >> ((jj >> 5) * 2)) & 3) << 4);
+            acc += x[k] * (a16 * float(q - 32));
+        }
+    } else if (T == 10 || T == 11) {
+        const uint8_t* wp = w; float d = 0, dm = 0, a = 0, m = 0;
+        for (uint32_t k = 0; k < cols; ++k) {
+            const uint32_t i = k & 255;
+            if (i == 0) { wp = w + (uint64_t(row) * cols + k) / 256 * (T == 10 ? 84 : 110); if (T == 10) { d = decode::half(decode::u16(wp + 80)); dm = decode::half(decode::u16(wp + 82)); } }
+            if ((i & 15) == 0) {
+                if (T == 10) { uint32_t sc = wp[i >> 4]; a = d * float(sc & 15); m = dm * float(sc >> 4); }
+                else { uint32_t g = i >> 4; const uint8_t* s = wp + 96; int sc = int(((s[g & 7] >> (((g >> 3) & 1) * 4)) & 15) | (((s[8 + (g & 3)] >> (((g >> 2) & 3) * 2)) & 3) << 4)) - 32; a = decode::half(decode::u16(wp + 108)) * float(sc); m = 0; }
+            }
+            uint32_t q = (wp[(T == 10 ? 16 : 32) + (i >> 7) * 32 + (i & 31)] >> (((i & 127) >> 5) * 2)) & 3;
+            if (T == 11 && !(wp[i & 31] & (1u << (i >> 5)))) q -= 4;
+            acc += x[k] * (T == 10 ? a * float(q) - m : a * float(q));
+        }
+    } else if (T == 16) {  // kernel-native group quant (T is the sentinel; the real type is p.weight.type)
+        const uint32_t type = p.weight.type, be = decode::block_elements(type), bb = decode::block_bytes(type), bits = type & 255;
+        const uint8_t* wp = w; float a = 0, zp = 0;
+        for (uint32_t k = 0; k < cols; ++k) {
+            if (k % be == 0) { wp = w + (uint64_t(row) * cols + k) / be * bb; a = decode::half(decode::u16(wp)); zp = float(int(wp[2])); }
+            const uint32_t j = k % be, bit = j * bits;
+            uint32_t q = (wp[3 + (bit >> 3)] | (uint32_t(wp[4 + (bit >> 3)]) << 8)) >> (bit & 7) & ((1u << bits) - 1);
+            acc += x[k] * (a * float(int(q) - int(zp)));
+        }
+    } else if (T == 0) {  // F32: direct float read, no decode machinery
+        const float* fp = reinterpret_cast<const float*>(w);
+        for (uint32_t k = 0; k < cols; ++k) acc += x[k] * fp[uint64_t(row) * cols + k];
+    } else if (T == 1) {  // F16: direct uint16 read + half expansion
+        const uint16_t* hp = reinterpret_cast<const uint16_t*>(w);
+        for (uint32_t k = 0; k < cols; ++k) acc += x[k] * decode::half(hp[uint64_t(row) * cols + k]);
+    } else if (T == 30) {  // BF16: direct uint16 read + bit-shift to f32
+        const uint16_t* bp = reinterpret_cast<const uint16_t*>(w);
+        for (uint32_t k = 0; k < cols; ++k) acc += x[k] * decode::from_bits(uint32_t(bp[uint64_t(row) * cols + k]) << 16);
+    } else {
+        // Unhandled type at compile time: defer to the plan's runtime type so the
+        // kernel is still correct (per-element div/mod in decode::weight) even though
+        // the dispatcher normally routes such types through matmul_simt instead.
+        for (uint32_t k = 0; k < cols; ++k) acc += x[k] * decode::weight(p.weight.type, w, uint64_t(row) * cols + k);
+    }
+    p.output[row] = acc + (p.bias ? p.bias[row] : 0);
+}
 __global__ void norm_kernel(NormPlan p) {
     __shared__ float mean, inv; uint32_t r = blockIdx.x; const float* x = p.input + uint64_t(r) * p.cols;
     if (!threadIdx.x) { mean = 0; if (p.layer_norm) { for (uint32_t i = 0; i < p.cols; ++i) mean += x[i]; mean /= p.cols; } float sum = 0; for (uint32_t i = 0; i < p.cols; ++i) { float d = x[i] - mean; sum += d * d; } inv = 1 / sqrtf(sum / p.cols + p.epsilon); }
@@ -224,23 +342,51 @@ __device__ float element(Codec c, const uint8_t* src, uint32_t i) {
 __device__ bool visible(AttentionPlan p, uint32_t t, uint32_t position) { return t <= position && t < p.context && (!p.window || t < p.sink_tokens || uint64_t(t) + p.window > position); }
 __device__ float qk(AttentionPlan p, uint32_t q, uint32_t h, const uint8_t* key) { uint32_t kh = h / (p.heads / p.kv_heads); float sum = 0; for (uint32_t d = 0; d < p.head_dim; ++d) sum += p.query[(uint64_t(q) * p.heads + h) * p.head_dim + d] * element(p.codec, key, kh * p.head_dim + d); return sum * (p.scale ? p.scale : 1 / sqrtf(float(p.head_dim))); }
 __global__ void attn_init_kernel(AttentionPlan p) { uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x, rows = uint64_t(p.queries) * p.heads; if (i < rows) { p.global_max[i] = -INFINITY; p.denominator[i] = 0; } if (i < rows * p.value_dim) p.numerator[i] = 0; }
+__device__ inline float block_max(float local) {
+    // fmaxf is exact and order-free, so a block reduction matches any serial
+    // association of the same values. Every lane contributes its own scan.
+    __shared__ float red[128];
+    red[threadIdx.x] = local; __syncthreads();
+    float m = -INFINITY;
+    for (uint32_t i = 0; i < blockDim.x; ++i) m = fmaxf(m, red[i]);
+    return m;
+}
 __global__ void attn_page_kernel(AttentionPagePlan part) {
     auto p = part.attention; uint64_t row = blockIdx.x; uint32_t q = uint32_t(row / p.heads), h = uint32_t(row % p.heads), position = uint32_t(p.positions[q]);
-    if (part.max_pass) { if (!threadIdx.x) { float maximum = p.global_max[row]; for (uint32_t j = 0; j < p.block_tokens; ++j) if (visible(p, part.page_index * p.block_tokens + j, position)) maximum = fmaxf(maximum, qk(p, q, h, part.page + uint64_t(j) * p.row_bytes)); p.global_max[row] = maximum; } return; }
+    const uint32_t base = part.page_index * p.block_tokens;
+    if (part.max_pass) {
+        float local = p.global_max[row];
+        for (uint32_t j = threadIdx.x; j < p.block_tokens; j += blockDim.x) if (visible(p, base + j, position)) local = fmaxf(local, qk(p, q, h, part.page + uint64_t(j) * p.row_bytes));
+        float m = block_max(local); if (!threadIdx.x) p.global_max[row] = fmaxf(p.global_max[row], m);
+        return;
+    }
     __shared__ float weights[128];
-    if (!threadIdx.x) { float den = 0; for (uint32_t j = 0; j < p.block_tokens; ++j) { weights[j] = visible(p, part.page_index * p.block_tokens + j, position) ? expf(qk(p, q, h, part.page + uint64_t(j) * p.row_bytes) - p.global_max[row]) : 0; den += weights[j]; } p.denominator[row] += den; }
+    for (uint32_t j = threadIdx.x; j < p.block_tokens; j += blockDim.x) weights[j] = visible(p, base + j, position) ? expf(qk(p, q, h, part.page + uint64_t(j) * p.row_bytes) - p.global_max[row]) : 0;
+    __syncthreads();
+    if (!threadIdx.x) { float den = 0; for (uint32_t j = 0; j < p.block_tokens; ++j) den += weights[j]; p.denominator[row] += den; }
     __syncthreads(); uint32_t kh = h / (p.heads / p.kv_heads);
-    for (uint32_t d = threadIdx.x; d < p.value_dim; d += blockDim.x) { float numer = 0; for (uint32_t j = 0; j < p.block_tokens; ++j) if (visible(p, part.page_index * p.block_tokens + j, position)) numer += weights[j] * element(p.codec, part.page + uint64_t(p.block_tokens) * p.row_bytes + uint64_t(j) * (p.value_row_bytes ? p.value_row_bytes : p.row_bytes), kh * p.value_dim + d); p.numerator[row * p.value_dim + d] += numer; }
+    for (uint32_t d = threadIdx.x; d < p.value_dim; d += blockDim.x) { float numer = 0; for (uint32_t j = 0; j < p.block_tokens; ++j) if (visible(p, base + j, position)) numer += weights[j] * element(p.codec, part.page + uint64_t(p.block_tokens) * p.row_bytes + uint64_t(j) * (p.value_row_bytes ? p.value_row_bytes : p.row_bytes), kh * p.value_dim + d); p.numerator[row * p.value_dim + d] += numer; }
 }
 template<bool Prefill> __global__ void attn_resident_kernel(AttentionPlan p) {
     uint64_t row = blockIdx.x; uint32_t q = Prefill ? uint32_t(row / p.heads) : 0, h = uint32_t(row % p.heads), position = uint32_t(p.positions[q]); __shared__ float maximum, denominator, weights[128];
-    if (!threadIdx.x) { maximum = -INFINITY; denominator = 0; for (uint32_t page = 0; page < p.block_count; ++page) { const uint8_t* span = p.pool ? p.pool + p.block_offsets[page] : reinterpret_cast<const uint8_t*>(p.block_offsets[page]); for (uint32_t j = 0; j < p.block_tokens; ++j) if (visible(p, page * p.block_tokens + j, position)) maximum = fmaxf(maximum, qk(p, q, h, span + uint64_t(j) * p.row_bytes)); } }
+    float local = -INFINITY;
+    for (uint32_t page = 0; page < p.block_count; ++page) {
+        const uint8_t* sk = p.pool ? p.pool + p.block_offsets[page] : reinterpret_cast<const uint8_t*>(p.block_offsets[page]);
+        for (uint32_t j = threadIdx.x; j < p.block_tokens; j += blockDim.x) if (visible(p, page * p.block_tokens + j, position)) local = fmaxf(local, qk(p, q, h, sk + uint64_t(j) * p.row_bytes));
+    }
+    float m = block_max(local);
+    if (!threadIdx.x) { maximum = m; denominator = 0; }
+    __syncthreads();
     for (uint32_t d = threadIdx.x; d < p.value_dim; d += blockDim.x) p.output[row * p.value_dim + d] = 0;
     __syncthreads(); uint32_t kh = h / (p.heads / p.kv_heads);
     for (uint32_t page = 0; page < p.block_count; ++page) {
-        const uint8_t* span = p.pool ? p.pool + p.block_offsets[page] : reinterpret_cast<const uint8_t*>(p.block_offsets[page]);
-        if (!threadIdx.x) { float den = 0; for (uint32_t j = 0; j < p.block_tokens; ++j) { weights[j] = visible(p, page * p.block_tokens + j, position) ? expf(qk(p, q, h, span + uint64_t(j) * p.row_bytes) - maximum) : 0; den += weights[j]; } denominator += den; }
-        __syncthreads(); for (uint32_t d = threadIdx.x; d < p.value_dim; d += blockDim.x) { float numer = 0; for (uint32_t j = 0; j < p.block_tokens; ++j) if (visible(p, page * p.block_tokens + j, position)) numer += weights[j] * element(p.codec, span + uint64_t(p.block_tokens) * p.row_bytes + uint64_t(j) * (p.value_row_bytes ? p.value_row_bytes : p.row_bytes), kh * p.value_dim + d); p.output[row * p.value_dim + d] += numer; } __syncthreads();
+        const uint8_t* sk = p.pool ? p.pool + p.block_offsets[page] : reinterpret_cast<const uint8_t*>(p.block_offsets[page]);
+        for (uint32_t j = threadIdx.x; j < p.block_tokens; j += blockDim.x) weights[j] = visible(p, page * p.block_tokens + j, position) ? expf(qk(p, q, h, sk + uint64_t(j) * p.row_bytes) - maximum) : 0;
+        __syncthreads();
+        if (!threadIdx.x) { float den = 0; for (uint32_t j = 0; j < p.block_tokens; ++j) den += weights[j]; denominator += den; }
+        __syncthreads();
+        for (uint32_t d = threadIdx.x; d < p.value_dim; d += blockDim.x) { float numer = 0; for (uint32_t j = 0; j < p.block_tokens; ++j) if (visible(p, page * p.block_tokens + j, position)) numer += weights[j] * element(p.codec, sk + uint64_t(p.block_tokens) * p.row_bytes + uint64_t(j) * (p.value_row_bytes ? p.value_row_bytes : p.row_bytes), kh * p.value_dim + d); p.output[row * p.value_dim + d] += numer; }
+        __syncthreads();
     }
     for (uint32_t d = threadIdx.x; d < p.value_dim; d += blockDim.x) p.output[row * p.value_dim + d] /= denominator;
 }
@@ -249,7 +395,25 @@ uint32_t grid(uint64_t n) { return uint32_t((n + threads - 1) / threads); }
 }
 void empty(hipStream_t s) { hipLaunchKernelGGL(empty_kernel, dim3(1), dim3(1), 0, s); }
 void capabilities(uint32_t* p, hipStream_t s) { hipLaunchKernelGGL(caps_kernel, dim3(1), dim3(32), 0, s, p); }
-void matmul(const MatmulPlan& p, hipStream_t s) { if (p.variant == 2) hipLaunchKernelGGL(matmul_wmma, dim3((p.weight.rows + 15) / 16, (p.tokens + 15) / 16), dim3(32), 0, s, p); else hipLaunchKernelGGL(matmul_simt, dim3(grid(uint64_t(p.tokens) * p.weight.rows)), dim3(threads), 0, s, p); }
+void matmul(const MatmulPlan& p, hipStream_t s) {
+    if (p.variant == 2) { hipLaunchKernelGGL(matmul_wmma, dim3((p.weight.rows + 15) / 16, (p.tokens + 15) / 16), dim3(32), 0, s, p); return; }
+    if (p.variant == 3 && p.tokens == 1) {
+        dim3 g = dim3((p.weight.rows + 63) / 64);
+        if (p.weight.type & decode::kGroupTag) { hipLaunchKernelGGL(matmul_gemv_t<16>, g, dim3(64), 0, s, p); return; }
+        switch (p.weight.type) {
+            case 12: hipLaunchKernelGGL(matmul_gemv_t<12>, g, dim3(64), 0, s, p); return;
+            case 13: hipLaunchKernelGGL(matmul_gemv_t<13>, g, dim3(64), 0, s, p); return;
+            case 14: hipLaunchKernelGGL(matmul_gemv_t<14>, g, dim3(64), 0, s, p); return;
+            case 10: hipLaunchKernelGGL(matmul_gemv_t<10>, g, dim3(64), 0, s, p); return;
+            case 11: hipLaunchKernelGGL(matmul_gemv_t<11>, g, dim3(64), 0, s, p); return;
+            case 0:  hipLaunchKernelGGL(matmul_gemv_t<0>,  g, dim3(64), 0, s, p); return;
+            case 1:  hipLaunchKernelGGL(matmul_gemv_t<1>,  g, dim3(64), 0, s, p); return;
+            case 30: hipLaunchKernelGGL(matmul_gemv_t<30>, g, dim3(64), 0, s, p); return;
+            default: break;
+        }
+    }
+    hipLaunchKernelGGL(matmul_simt, dim3(grid(uint64_t(p.tokens) * p.weight.rows)), dim3(threads), 0, s, p);
+}
 void norm(const NormPlan& p, hipStream_t s) { hipLaunchKernelGGL(norm_kernel, dim3(p.rows), dim3(threads), 0, s, p); }
 void activation(const ActivationPlan& p, hipStream_t s) { hipLaunchKernelGGL(act_kernel, dim3(grid(p.elements)), dim3(threads), 0, s, p); }
 void add(const AddPlan& p, hipStream_t s) { hipLaunchKernelGGL(add_kernel, dim3(grid(p.elements)), dim3(threads), 0, s, p); }

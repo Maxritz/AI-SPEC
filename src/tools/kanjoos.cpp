@@ -149,7 +149,7 @@ int cmd_generate(int argc, char** argv) {
     const bool stream = a.has("--stream");
     const auto started = std::chrono::steady_clock::now();
     std::string pending; size_t sent = 0;
-    for (uint64_t guard = 0; !g->done; ++guard) {
+    while (!g->done) {
         engine.step(*g);
         if (!stream) { continue; }
         size_t hold = 0;
@@ -296,6 +296,7 @@ json host_block(const knj::inference::Engine& engine, const knj::Config& config)
     const auto memory = knj::platform::memory_info();
     json host = {{"backend", engine.config().backend},
                  {"is_gpu", engine.backend_is_gpu()},
+                 {"device", engine.device_name()},
                  {"io_backend", io.backend},
                  {"io_native", io.native},
                  {"cpus", std::thread::hardware_concurrency()},
@@ -433,6 +434,7 @@ int cmd_bench(int argc, char** argv) {
     else {
         std::cout << "kanjoos bench" << (source["synthetic_fixture"].get<bool>() ? " (synthetic fixture: not a real-model result)" : "") << "\n";
         std::cout << "model " << source["model"].get<std::string>() << ", host backend " << host["backend"].get<std::string>()
+                  << ", device " << host.value("device", "unreported") << (host["is_gpu"].get<bool>() ? " (gpu)" : " (cpu reference)")
                   << ", io " << host["io_backend"].get<std::string>() << "\n";
         for (auto& [name, m] : modes.items()) {
             std::cout << name << ": prefill " << m["prefill_tokens_per_s"]["median"].get<double>() << " tok/s, decode "

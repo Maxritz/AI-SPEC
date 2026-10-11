@@ -59,6 +59,7 @@ public:
     bool has_mtp() const { return spec_.mtp_layers != 0 && !drafter_; }
     bool has_drafter() const { return drafter_ != nullptr; }
     bool backend_is_gpu() const { return backend_->caps().is_gpu; }
+    const std::string& device_name() const { return backend_->caps().name; }
     io::Capabilities io_capabilities() const;
     const profile::Counters& counters() const { return profile_.counters; }
 private:

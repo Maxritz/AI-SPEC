@@ -2,6 +2,7 @@ schema_version = 1
 [gpu]
 backend = "auto"
 wmma = false
+matmul = "auto"
 vram_ceiling_mib = 0
 kv_mib = 0
 expert_slots = 0

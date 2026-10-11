@@ -88,9 +88,10 @@ KNJ_HD inline uint32_t block_bytes(uint32_t t) {
         default: return 0;
     }
 }
-KNJ_HD inline float weight(uint32_t t, const uint8_t* data, uint64_t index) {
-    const uint32_t be = block_elements(t), bb = block_bytes(t);
-    const uint8_t* p = data + (index / be) * bb; uint32_t i = uint32_t(index % be);
+// Same formulas as weight(), but p must already point at the element's block
+// start and i must be block-relative. Callers that walk a row in order advance
+// the pointer themselves and avoid the per-element 64-bit div/mod.
+KNJ_HD inline float weight_in_block(uint32_t t, const uint8_t* p, uint32_t i) {
     if (t & kGroupTag) return half(u16(p)) * float(int(code(p + 3, i, t & 255)) - int(p[2]));
     switch (t) {
         case 0: return from_bits(u32(p));
@@ -136,6 +137,10 @@ KNJ_HD inline float weight(uint32_t t, const uint8_t* data, uint64_t index) {
         case 15: return from_bits(u32(p)) * float(int8_t(p[4 + i]));
         default: return from_bits(0x7fc00000u); // unreachable after plan validation
     }
+}
+KNJ_HD inline float weight(uint32_t t, const uint8_t* data, uint64_t index) {
+    const uint32_t be = block_elements(t), bb = block_bytes(t);
+    return weight_in_block(t, data + (index / be) * bb, uint32_t(index % be));
 }
 }  // namespace knj::decode
 #undef KNJ_HD

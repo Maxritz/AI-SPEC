@@ -17,6 +17,7 @@ struct Config {
     uint32_t io_queue_depth = 32;           // in-flight reads for a native lower-layer backend
     std::string io_backend = "auto";        // auto | portable | io_uring | iocp
     bool rebuild_stale_store = false, wmma = false, allow_quantized_kv = false, subtract_floor = true, force_cold = false, use_prefix_cache = true, adaptive_prefetch = false;
+    std::string matmul = "auto";  // auto | simt | staged | dot4 | wmma — auto sweeps the bit-identical variants, forced non-defaults opt into precision loss
     std::string store_dir, tune_dir = "kanjoos-tune", profile_dir, api_key_env = "KANJOOS_API_KEY", drafter, drafter_path;
     static Config load(const std::string& path);
     void validate() const;

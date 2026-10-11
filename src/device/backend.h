@@ -41,6 +41,9 @@ public:
     virtual EventPtr create_event() = 0;
     virtual void record(const EventPtr&, StreamId) = 0;
     virtual void wait_event(StreamId, const EventPtr&) = 0;
+    // Elapsed device time between two recorded events, microseconds. The portable default
+    // subtracts host timestamps; a GPU backend overrides with a hardware pair measurement.
+    virtual double event_pair_us(const EventPtr& start, const EventPtr& end) const { return double(end->timestamp_ns() - start->timestamp_ns()) / 1000.0; }
     virtual void synchronize(StreamId) = 0;
     virtual void copy(void* dst, const void* src, uint64_t bytes, CopyKind, StreamId) = 0;
     virtual void zero(void*, uint64_t bytes, StreamId) = 0;

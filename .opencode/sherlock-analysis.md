@@ -51,3 +51,37 @@ Derived: 2.1 GFLOP per token against 9.65 s/token = **0.22 GFLOP/s effective**, 
 - Two independent workloads (A and B) agree within 3 percentage points on every rank, so the
   ranking is not a single noisy measurement.
 - Every number above was produced by `build/kanjoos bench` on this host; none is inferred.
+
+## [RUN-005] 2026-10-11 — MODE: STAGED v3 + SIMT v0 — TARGET: RX 9070 XT (gfx1201)
+### BASELINE
+- Build: Release, HIP backend, ROCm G:\ROCM10RT-gfx1201
+- Model: smolcode-coder-cpp-1.5b-q4_k_m.gguf
+- Workload: prompt 32 tokens, 16 new tokens, greedy, repeat 1
+
+### FINDINGS
+- **Staged (v3)**: decode 9.09 tok/s, ms/token p50 116.6 ms, TTFT 2822 ms
+- **Simt (v0)**: decode 1.65 tok/s, ms/token p50 642 ms
+- **Improvement**: 5.5x overall throughput (staged vs simt)
+
+### Per-op comparison (dev_us/op, staged v3 vs simt v0):
+| kernel shape | simt us/op | staged us/op | speedup |
+|---|---|---|---|
+| gate/up 8960x1536 (t12) | 3469 | 2135 | 1.6x |
+| up 1536x8960 (t14) | 9554 | 2096 | 4.6x |
+| down 1536x8960 (t12) | 11214 | 2095 | 5.4x |
+| attn_out 1536x1536 (t12) | 1744 | 291 | 6.0x |
+| kv 256x1536 (t12) | 1695 | 242 | 7.0x |
+| head 151936x1536 (t14) | 63265 | 35290 | 1.8x |
+
+### 3x fc bit-identity (prompt "Hello", 8 greedy tokens, no-speculate)
+- CPU:      [13, 358, 2776, 264, 220, 16, 21, 4666]
+- GPU-staged: [13, 358, 2776, 264, 220, 16, 21, 4666] ✓
+- GPU-simt:  [13, 358, 2776, 264, 220, 16, 21, 4666] ✓
+
+### ACTIONS
+- [x] Rebuild in Release mode for realistic per-op timings
+- [x] ctest: 10/10 Debug, 9/9 Release (model test skipped for time)
+- [x] Per-op profiling via trace_summary.py confirms variant 3 routing throughout
+- [ ] Head GEMV decode 35.3ms vs 0.21ms floor (RC-1: register/wider-load decode or f16-resident trunk)
+- [ ] E4 launch floor (~2ms/token) not yet fused (W-9)
+- [ ] Prefill M>1 still uses SIMT variant (staged is decode-only by design)

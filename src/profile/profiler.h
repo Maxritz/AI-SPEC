@@ -49,6 +49,7 @@ private:
     std::array<Acc, size_t(OpClass::Count)> accumulated_{};
     std::map<uint32_t, uint64_t> previous_end_; uint64_t steps_ = 0, tokens_ = 0, start_ns_;
     double floor_host_ = 0, floor_device_ = 0, floor_worker_ = 0; uint32_t floor_samples_ = 0;
+    uint64_t records_dropped_ = 0;
     std::vector<double> latencies_; std::vector<OpRecord> records_; nlohmann::json header_, transitions_ = nlohmann::json::array();
 };
 }  // namespace knj::profile

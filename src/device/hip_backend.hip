@@ -50,6 +50,11 @@ public:
     EventPtr create_event() override { return std::make_shared<HipEvent>(clock_); }
     void record(const EventPtr& event, StreamId id) override { auto e = std::dynamic_pointer_cast<HipEvent>(event); require(e && e->clock == clock_, "foreign HIP event"); check(hipEventRecord(e->event, stream(id)), "record event"); e->recorded.store(true); }
     void wait_event(StreamId id, const EventPtr& event) override { auto e = std::dynamic_pointer_cast<HipEvent>(event); require(e && e->clock == clock_ && e->recorded.load(), "foreign/unrecorded dependency"); check(hipStreamWaitEvent(stream(id), e->event, 0), "stream dependency"); }
+    double event_pair_us(const EventPtr& start, const EventPtr& end) const override {
+        auto s = std::dynamic_pointer_cast<HipEvent>(start), e = std::dynamic_pointer_cast<HipEvent>(end);
+        require(s && e && s->clock == clock_ && e->clock == clock_ && s->recorded.load() && e->recorded.load(), "foreign/unrecorded HIP event pair");
+        check(hipSetDevice(index_), "set pair device"); float ms; check(hipEventElapsedTime(&ms, s->event, e->event), "event pair elapsed"); return double(ms) * 1000.0;
+    }
     void synchronize(StreamId id) override { check(hipStreamSynchronize(stream(id)), "explicit stream synchronization"); }
     void copy(void* dst, const void* src, uint64_t n, CopyKind kind, StreamId id) override {
         if (kind == CopyKind::H2H) { struct Copy { void* dst; const void* src; size_t n; }; auto c = new Copy{dst, src, host_size(n)}; auto status = hipLaunchHostFunc(stream(id), [](void* ctx) { std::unique_ptr<Copy> c(static_cast<Copy*>(ctx)); std::memmove(c->dst, c->src, c->n); }, c); if (status != hipSuccess) delete c; check(status, "host copy dependency"); return; }
@@ -57,7 +62,7 @@ public:
     }
     void zero(void* p, uint64_t n, StreamId id) override { check(hipMemsetAsync(p, 0, host_size(n), stream(id)), "async zero"); }
     void empty(StreamId id) override { kernels::empty(stream(id)); launched(); }
-    void matmul(const compute::MatmulPlan& p, StreamId id) override { compute::validate(p.weight); require(p.input && p.output && p.tokens && p.variant <= 2, "invalid HIP matmul"); require(p.variant != 2 || caps_.has_wmma, "WMMA is unavailable on this device"); kernels::matmul(p, stream(id)); launched(); }
+    void matmul(const compute::MatmulPlan& p, StreamId id) override { compute::validate(p.weight); require(p.input && p.output && p.tokens && p.variant <= 3, "invalid HIP matmul"); require(p.variant != 2 || caps_.has_wmma, "WMMA is unavailable on this device"); kernels::matmul(p, stream(id)); launched(); }
     void router(const compute::RouterPlan& p, StreamId id) override { require(p.experts && p.experts <= 1024 && p.top_k && p.top_k <= p.experts && p.groups && p.groups <= 64 && p.experts % p.groups == 0 && p.groups_used && p.groups_used <= p.groups && p.top_k <= p.groups_used * (p.experts / p.groups), "invalid/unsupported HIP router geometry"); kernels::router(p, stream(id)); launched(); }
     void attention(const compute::AttentionPlan& p, StreamId id) override { require(p.block_tokens <= 128 && p.heads % p.kv_heads == 0 && p.head_dim && p.value_dim && p.block_offsets, "invalid paged HIP attention"); kernels::attention(p, stream(id)); launched(); }
 #define KNJ_HIP_OP(name, plan) void name(const compute::plan& p, StreamId id) override { kernels::name(p, stream(id)); launched(); }

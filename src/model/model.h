@@ -47,7 +47,7 @@ struct Result {
 };
 class Model {
 public:
-    Model(const gguf::ModelIndex&, Spec, Runtime&, transfer::Engine&, profile::Profiler&, uint64_t workspace_bytes, uint32_t max_batch, compute::ExpertExecutor*, residency::Manager*, residency::Predictor*);
+    Model(const gguf::ModelIndex&, Spec, Runtime&, transfer::Engine&, uint64_t workspace_bytes, uint32_t max_batch, compute::ExpertExecutor*, residency::Manager*, residency::Predictor*);
     const Spec& spec() const { return spec_; }
     const gguf::ModelIndex& index() const { return index_; }
     uint32_t max_batch() const { return max_batch_; }
@@ -69,11 +69,17 @@ public:
     std::vector<float> embed_rows(const std::vector<int32_t>& tokens);
     std::vector<float> head_rows(const std::vector<float>& hidden);
     Result mtp(kv::Session&, kv::Cache&, attn::Attention&, const std::vector<int32_t>& tokens, const std::vector<float>& target_hidden_rows, const std::function<bool()>& cancelled = {}, residency::ActivationTrace* activation = nullptr);
-    void tune(Autotuner&, bool allow_wmma);
+    void tune(Autotuner&, const std::string& mode, bool allow_wmma);
+    uint32_t matmul_variant() const { return variant_; }
 private:
-    const gguf::ModelIndex& index_; Spec spec_; Runtime& runtime_; transfer::Engine& transfers_; profile::Profiler& profile_;
+    const gguf::ModelIndex& index_; Spec spec_; Runtime& runtime_; transfer::Engine& transfers_;
     compute::ExpertExecutor* experts_; residency::Manager* residency_; residency::Predictor* predictor_;
     std::map<std::string, Tensor> tensors_; device::Buffer workspace_; uint32_t max_batch_, variant_ = 0; uint64_t loaded_bytes_ = 0;
+    // Persistent pinned host staging, sized to the largest request seen and reused across decode
+    // steps. Each buffer is fully consumed (copy waited, bytes copied out) before its producing
+    // call returns, and the engine calls the model single-threaded, so no step reads another's contents.
+    device::Buffer stage_tokens_, stage_hidden_, stage_logits_, stage_route_ids_, stage_route_weights_;
+    void ensure_staging(device::Buffer&, uint64_t bytes);
     struct Frame;
     uint64_t frame_bytes(uint32_t) const;
     uint64_t scratch_width() const;  // widest per-token scratch row (shared by frame_bytes and run)

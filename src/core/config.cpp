@@ -30,7 +30,7 @@ Config Config::load(const std::string& path) {
 #define REAL(key, field) if (k == key) c.field = real(); else
 #define BOOL(key, field) if (k == key) c.field = boolean(); else
         UINT("schema_version", schema_version)
-        STR("gpu.backend", backend) BOOL("gpu.wmma", wmma) BYTES("gpu.vram_ceiling_mib", vram_ceiling, 1ull << 20)
+        STR("gpu.backend", backend) BOOL("gpu.wmma", wmma) STR("gpu.matmul", matmul) BYTES("gpu.vram_ceiling_mib", vram_ceiling, 1ull << 20)
         BYTES("gpu.kv_mib", kv_bytes, 1ull << 20) UINT("gpu.token_block", token_block) UINT("gpu.layer_slab", layer_slab)
         UINT("gpu.expert_slots", slot_count) REAL("gpu.kv_fraction", kv_fraction) BYTES("gpu.workspace_mib", workspace_bytes, 1ull << 20)
         STR("kv.codec", kv_codec) BOOL("kv.allow_precision_reduction", allow_quantized_kv) BOOL("kv.prefix_cache", use_prefix_cache)
@@ -74,9 +74,10 @@ void Config::validate() const {
     require(port > 0 && measured_h2d_gbs >= 0 && spill_wire_ms >= 0, "invalid server/transfer settings");
     require(kv_codec == "f32" || kv_codec == "f16" || kv_codec == "bf16" || kv_codec == "fp8" || kv_codec == "int8" || kv_codec == "int4", "unknown KV codec");
     require(allow_quantized_kv || (kv_codec != "fp8" && kv_codec != "int8" && kv_codec != "int4"), "quantized KV requires explicit precision-reduction opt-in");
+    require(matmul == "auto" || matmul == "simt" || matmul == "staged" || matmul == "dot4" || matmul == "wmma", "gpu.matmul must be auto, simt, staged, dot4 or wmma");
     require(profiling == "off" || profiling == "counters" || profiling == "full" || profiling == "table" || profiling == "json" || profiling == "csv" || profiling == "no-subtract", "unknown profiling mode");
 }
 nlohmann::json Config::json() const {
-    return {{"schema_version", schema_version}, {"backend", backend}, {"kv_codec", kv_codec}, {"token_block", token_block}, {"layer_slab", layer_slab}, {"prefill_chunk", prefill_chunk}, {"slot_count", slot_count}, {"kv_bytes", kv_bytes}, {"warm_bytes", warm_bytes}, {"staging_chunk_bytes", staging_chunk_bytes}, {"staging_chunks", staging_chunks}, {"profiling", profiling}, {"wmma", wmma}, {"allow_precision_reduction", allow_quantized_kv}, {"measured_h2d_gbs", measured_h2d_gbs}};
+    return {{"schema_version", schema_version}, {"backend", backend}, {"kv_codec", kv_codec}, {"token_block", token_block}, {"layer_slab", layer_slab}, {"prefill_chunk", prefill_chunk}, {"slot_count", slot_count}, {"kv_bytes", kv_bytes}, {"warm_bytes", warm_bytes}, {"staging_chunk_bytes", staging_chunk_bytes}, {"staging_chunks", staging_chunks}, {"profiling", profiling}, {"wmma", wmma}, {"matmul", matmul}, {"allow_precision_reduction", allow_quantized_kv}, {"measured_h2d_gbs", measured_h2d_gbs}};
 }
 }  // namespace knj
