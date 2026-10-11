@@ -22,14 +22,16 @@ expert eviction and KV demotion keep output identical, prefix reuse and checkpoi
 suspend/resume are exact, and (where the family has NextN) MTP speculation is lossless.
 These checks run on **synthetic random-weight fixtures** (`tests/unit/synthetic_model.h`).
 They establish that the code implements the documented semantics. They say nothing about
-real-model quality, speed, or acceptance.
+real-model quality, speed, or acceptance. All 10 families also run through the GPU HIP
+backend on the RX 9070 XT (10/10 ctest pass); see §13 for the GPU verification record.
 
-## Implemented and verified on synthetic fixtures
+## Implemented and verified on synthetic fixtures (CPU + GPU)
 
-Each row is one of the nine profiles in `synth::family()`, run by `family_suite()` in
+Each row is one of the **ten** profiles in `synth::family()`, run by `family_suite()` in
 `tests/unit/test_model.cpp`. Together with the op-level Gated DeltaNet checks, the
 `ffn_norm` alias check and the 45 quantized-fixture runs (15 ggml types x 3 families),
-`test_model` runs 2,732 checks in total.
+`test_model` runs 2,815 checks in total. On the GPU (RX 9070 XT, gfx1201), all 10
+families pass 10/10 ctest and 76/76 GPU-specific kernel checks.
 
 | GGUF arch | Models | Features the family relies on | Status |
 |---|---|---|---|

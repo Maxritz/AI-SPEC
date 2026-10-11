@@ -48,7 +48,7 @@ from the model definition.
 | `kanjoos generate`, `serve`, `doctor` | implemented | Verified (manual) |
 | Measurement tooling: `kanjoos bench` (throughput, time to first token, per-token latency, drafter acceptance) and `kanjoos ppl` (teacher-forced NLL and perplexity) | implemented | Verified (host): `model` checks `Engine::score` against the double-precision reference; both commands run on the synthetic fixture. Results in `docs/measurements/` are labelled as synthetic |
 | Windows build | not run | `BUILD.md` lists the known Windows code paths |
-| Real model files, quality numbers, performance numbers, acceptance on real drafters | not measured | no real weights (Hugging Face unreachable) and no GPU; the tooling is ready (see `docs/measurements/README.md`) |
+| Real model files, quality numbers, performance numbers, acceptance on real drafters | partially available | Real GGUF models exist at `H:\OLLAMA-Models\GGUF` and `G:\More-models` (80+ models); kernel-level verification on GPU complete. **Full model forward on a real GGUF file has not yet been run end to end** — see §13 below. The bench/ppl tooling is ready (see `docs/measurements/README.md`) |
 | AddressSanitizer and UndefinedBehaviorSanitizer (`KNJ_SANITIZE=ON`, Debug) | all 8 suites pass with no sanitizer reports | Verified (host) |
 
 ## Known limitations that affect correctness claims
@@ -131,7 +131,12 @@ These are not implemented in this tree. The architecture allow-list refuses them
   `docs/11-model-families.md` with what each needs.
 - **DSV4-stage DSpark drafters** (drafters with `hyper_connection.count` > 0). The loader
   refuses them with `Unsupported` and a named message.
-- **Real-model and GPU measurements.** Blocked by the sandbox (no weights, no GPU). The
-  tooling is complete and documented.
+- **Real-model and GPU measurements.** Previously blocked by the sandbox (no weights, no GPU).
+  This is now **resolved**: the development machine has an AMD Radeon RX 9070 XT (gfx1201,
+  15.92 GB VRAM, ROCm 10 at `G:\ROCM10RT-gfx1201`) and real GGUF models are available at
+  `H:\OLLAMA-Models\GGUF` and `G:\More-models`. GPU kernel verification is complete
+  (76/76 kernel checks, 10/10 ctest on GPU). Running a real model end-to-end through the
+  full engine on GPU remains the next verification step. The tooling is complete and
+  documented.
 - **Windows execution.** The IOCP reader compiles for Windows with Zig but has not run.
 

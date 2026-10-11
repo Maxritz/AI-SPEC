@@ -11,26 +11,32 @@ unnecessarily.
 
 **Measurement reality check (read this before quoting any number):**
 
-- **Synthetic fixtures only.** Every end-to-end model forward, routing,
-  KV, and speculation test runs against a deterministic synthetic Qwen3-MoE
-  model with random weights (`knj-synthetic-*`). No real GGUF model has been
-  executed end to end. Correctness is verified against an independent
-  double-precision CPU oracle, not against upstream model outputs.
-- **CPU reference backend for model-level benchmarks.** The bench/perplexity
-  numbers in `docs/measurements/` run on the CPU reference kernels (2 cores,
-  3.8 GiB RAM). They characterise the reference path, not GPU performance.
-- **GPU results are kernel-level microbenchmarks, not model throughput.**
-  The numbers in `docs/00-verified-facts.md` §8–9 (expert GEMM 5.2% of
-  peak, staged matmul "9.09 tok/s") measure individual kernels or
-  kernel-selection paths on one token. They are **not** end-to-end model
-  decode tok/s. A full Qwen3-30B-A3B step touches ~948 MB of expert weight
-  traffic at W4 over ~13.6 GB/s PCIe — ~70 ms/token minimum — regardless of
-  how fast the matmul itself is.
-- **No GPU end-to-end inference has been benchmarked.** A 24-token greedy
-  output was verified bit-identical to the CPU build (manual run, gfx1201),
-  but no throughput or latency measurement was taken on a real model.
-- **Real-model and GPU acceptance numbers:** not measured. See
-  `docs/10-implementation-status.md` line 51.
+- **Correctness is verified on synthetic fixtures.** Every end-to-end model
+  forward, routing, KV, and speculation test runs against a deterministic
+  synthetic Qwen3-MoE model with random weights (`knj-synthetic-*`).
+  Correctness is verified against an independent double-precision CPU oracle,
+  not against upstream model outputs.
+- **GPU is present and kernels are verified on it.** The development machine
+  has an AMD Radeon RX 9070 XT (gfx1201, 15.92 GB VRAM, ROCm 10 runtime at
+  `G:\ROCM10RT-gfx1201`). All HIP kernels (matmul variants, QKV, attention, KV
+  codec, router, expert dispatch) are compiled and pass 10/10 `ctest` on the GPU,
+  plus 76/76 GPU-specific kernel checks against the CPU reference. See
+  `docs/00-verified-facts.md` §8.
+- **Real GGUF models are available on the host.** Real model files exist at
+  `H:\OLLAMA-Models\GGUF` (~80 models including Qwen3-14B, Qwen3.5-35B-A3B MoE,
+  Gemma-4-26B MoE, olmoe, Minitstral-3-14B, etc.) and `G:\More-models`. These
+  models have **not yet been executed end to end** through the full engine on
+  GPU — the kernel and model-forward tests use synthetic fixtures. Running a
+  real GGUF model through `kanjoos generate` on the GPU is the next verification
+  step.
+- **GPU results are kernel-level measurements, not real-model throughput.**
+  The end-to-end profile in `bench-profile-staged/profile.json` was produced on
+  a synthetic MoE fixture, not a real model. The 9.09 tok/s figure (§8.9)
+  measures the staged GEMV kernel selection path on one token, not model-level
+  decode throughput.
+- **CPU reference backend numbers.** The bench/perplexity numbers in
+  `docs/measurements/` run on the CPU reference kernels (2 cores, 3.8 GiB RAM).
+  They characterise the reference path, not GPU performance.
 
 ------------------------------------------------------------------------
 

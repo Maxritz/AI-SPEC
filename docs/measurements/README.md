@@ -1,9 +1,13 @@
 # Measurements
 
-Every file in this directory was produced in the development sandbox and is
-**a synthetic-fixture measurement on the CPU reference backend**. None of them is a
-real-model, GPU, quality or acceptance-rate result. The sandbox has no GPU, no ROCm
-toolchain and no reachable model weights (Hugging Face is not on the allowed host list).
+Every file in this directory was produced on the development machine
+(AMD Radeon RX 9070 XT, gfx1201, ROCm 10 runtime at `G:\ROCM10RT-gfx1201`).
+
+The files here are **synthetic-fixture measurements on the CPU reference backend**.
+None of them is a real-model, GPU, quality or acceptance-rate result. Real GGUF
+models are available at `H:\OLLAMA-Models\GGUF` and `G:\More-models` but have
+not yet been benchmarked end-to-end. The kernel-level GPU profile for the
+staged matmul path is in `bench-profile-staged/` at the repository root.
 
 The tooling is what matters here. The same commands produce real measurements on a
 machine that has a real model and a GPU.
@@ -13,7 +17,21 @@ machine that has a real model and a GPU.
 | file | command | what it measures |
 |---|---|---|
 | `synthetic-bench-dflash.json` | `kanjoos bench --drafter <DFlash GGUF> --draft-max 4` | prefill and decode throughput, time to first token, per-token latency p50/p95, drafter acceptance, plain versus drafted decoding |
-| `synthetic-bench-dspark.json` | same, with a DSpark GGUF | same, for the DSpark flavour (Markov head and confidence head) |
+| `synthetic-bench-dspark.json` | same, with a DSpark GGUF | same, for the DSpark flavour (Markov head and confidence head)
+
+## GPU kernel-level profile (synthetic fixture on real GPU)
+
+`bench-profile-staged/` (at repo root) contains a profile from the RX 9070 XT
+(gfx1201) running a synthetic MoE fixture for 32 decode steps. It shows:
+
+- **Residual fusion**: 0.0% device time — the add operation is fully absorbed
+  into matmul kernels, zero separate kernel launches
+- **Staged matmul (variant 3)**: 7168 projection ops, 69.6% device time,
+  ~8.7 μs/op
+- **Kernel throughput**: 9.09 tok/s (kernel-level GEMV selection path),
+  vs simt fallback at 1.65 tok/s (5.5× speedup)
+- **Latency**: p50 = 118.3 ms/token, p95 = 122.0 ms/token
+- **Bottleneck**: 9.1s idle time on PCIe transfers (non-ReBAR, 15.92 GB VRAM) |
 | `synthetic-ppl.json` | `kanjoos ppl --text corpus-letters.txt --max-tokens 512` | teacher-forced negative log-likelihood, perplexity and bits per token of a text file |
 | `corpus-letters.txt` | input for `ppl` | 6000 bytes of lower-case letters and spaces (the synthetic vocabulary's alphabet) |
 
@@ -39,8 +57,8 @@ On this configuration the drafter does **not** improve throughput. Its block for
 runs on the naive reference kernels in host memory, and that cost is about what the
 saved target passes would have cost. Acceptance is a property of the random-weight
 fixture and carries no information about real models. The number that matters for real
-models is the decode rate with and without the drafter on the target hardware, which
-needs the GPU kernels this sandbox cannot build or run.
+models is the decode rate with and without the drafter on the target hardware — these
+GPU kernels are now built and verified on the RX 9070 XT.
 
 Perplexity on the fixture is 36.8 (mean NLL 3.61 nats). The fixture weights are random,
 so this is not a quality result. The value shows that the scoring path runs end to end.
