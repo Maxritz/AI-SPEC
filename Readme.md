@@ -9,6 +9,29 @@ the currently useful expert weights in the fastest available tier and
 streaming cold experts from RAM/NVMe without blocking the GPU
 unnecessarily.
 
+**Measurement reality check (read this before quoting any number):**
+
+- **Synthetic fixtures only.** Every end-to-end model forward, routing,
+  KV, and speculation test runs against a deterministic synthetic Qwen3-MoE
+  model with random weights (`knj-synthetic-*`). No real GGUF model has been
+  executed end to end. Correctness is verified against an independent
+  double-precision CPU oracle, not against upstream model outputs.
+- **CPU reference backend for model-level benchmarks.** The bench/perplexity
+  numbers in `docs/measurements/` run on the CPU reference kernels (2 cores,
+  3.8 GiB RAM). They characterise the reference path, not GPU performance.
+- **GPU results are kernel-level microbenchmarks, not model throughput.**
+  The numbers in `docs/00-verified-facts.md` §8–9 (expert GEMM 5.2% of
+  peak, staged matmul "9.09 tok/s") measure individual kernels or
+  kernel-selection paths on one token. They are **not** end-to-end model
+  decode tok/s. A full Qwen3-30B-A3B step touches ~948 MB of expert weight
+  traffic at W4 over ~13.6 GB/s PCIe — ~70 ms/token minimum — regardless of
+  how fast the matmul itself is.
+- **No GPU end-to-end inference has been benchmarked.** A 24-token greedy
+  output was verified bit-identical to the CPU build (manual run, gfx1201),
+  but no throughput or latency measurement was taken on a real model.
+- **Real-model and GPU acceptance numbers:** not measured. See
+  `docs/10-implementation-status.md` line 51.
+
 ------------------------------------------------------------------------
 
 ## 0. Mission
@@ -1834,6 +1857,15 @@ At minimum:
 
 # 43. Performance acceptance
 
+**None of the criteria below are measured end to end yet.** The engine
+reports the fields above in its profiler output, but full
+model-level TTFT/decode tok/s/p95 on a real GGUF model on GPU has **not**
+been benchmarked. The only measured performance numbers currently in the
+repository are GPU kernel microbenchmarks (see `docs/00-verified-facts.md`
+§8–9) and CPU-reference synthetic-fixture numbers (see
+`docs/measurements/`). See the measurement-realization block near the top
+of this document.
+
 Performance must be reported as a decomposition.
 
 At minimum:
@@ -1919,6 +1951,14 @@ This makes each optimisation attributable.
 
 Never compare only "before/after" without controlling the residency
 conditions.
+
+**Current state:** no benchmark ladder has been run end to end. The
+numbers in `docs/00-verified-facts.md` §8.9–8.10 are kernel-level
+microbenchmarks (expert GEMM, attention) on a single token at M=32, not
+model-level tok/s. The synthetic-fixture numbers in
+`docs/measurements/` are CPU-reference only (2 cores, random weights).
+The benchmark ladder above is a target contract; it is **not** a
+claim about measured model throughput.
 
 ------------------------------------------------------------------------
 
