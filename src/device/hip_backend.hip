@@ -56,6 +56,7 @@ public:
         check(hipSetDevice(index_), "set pair device"); float ms; check(hipEventElapsedTime(&ms, s->event, e->event), "event pair elapsed"); return double(ms) * 1000.0;
     }
     void synchronize(StreamId id) override { check(hipStreamSynchronize(stream(id)), "explicit stream synchronization"); }
+    void sync_check(StreamId id) { check(hipStreamSynchronize(stream(id)), "kernel execution"); check(hipGetLastError(), "post-kernel state"); }
     void copy(void* dst, const void* src, uint64_t n, CopyKind kind, StreamId id) override {
         if (kind == CopyKind::H2H) { struct Copy { void* dst; const void* src; size_t n; }; auto c = new Copy{dst, src, host_size(n)}; auto status = hipLaunchHostFunc(stream(id), [](void* ctx) { std::unique_ptr<Copy> c(static_cast<Copy*>(ctx)); std::memmove(c->dst, c->src, c->n); }, c); if (status != hipSuccess) delete c; check(status, "host copy dependency"); return; }
         auto k = kind == CopyKind::H2D ? hipMemcpyHostToDevice : kind == CopyKind::D2H ? hipMemcpyDeviceToHost : hipMemcpyDeviceToDevice; check(hipMemcpyAsync(dst, src, host_size(n), k, stream(id)), "asynchronous copy");
@@ -69,7 +70,22 @@ public:
 #define KNJ_HIP_OP(name, plan) void name(const compute::plan& p, StreamId id) override { kernels::name(p, stream(id)); launched(); }
     KNJ_HIP_OP(norm, NormPlan) KNJ_HIP_OP(activation, ActivationPlan) KNJ_HIP_OP(add, AddPlan) KNJ_HIP_OP(embed, EmbedPlan) KNJ_HIP_OP(rearrange, RearrangePlan) KNJ_HIP_OP(rope, RopePlan)
     KNJ_HIP_OP(expert, ExpertPlan) KNJ_HIP_OP(accumulate, AccumulatePlan) KNJ_HIP_OP(kv_write, KvWritePlan) KNJ_HIP_OP(attention_init, AttentionPlan) KNJ_HIP_OP(attention_page, AttentionPagePlan) KNJ_HIP_OP(attention_finish, AttentionPlan)
-    KNJ_HIP_OP(conv, ConvPlan) KNJ_HIP_OP(gdn_scan, GdnScanPlan) KNJ_HIP_OP(gated_norm, GatedNormPlan) KNJ_HIP_OP(sigmoid_gate, SigmoidGatePlan)
+    void conv(const compute::ConvPlan& p, StreamId id) override {
+        require(p.kernel > 1 && p.kernel <= 16 && p.channels && p.tokens, "invalid causal convolution launch");
+        require(p.input && p.state && p.weight && p.output, "conv plan has a null buffer pointer");
+        kernels::conv(p, stream(id)); sync_check(id);
+    }
+    void gdn_scan(const compute::GdnScanPlan& p, StreamId id) override {
+        require(p.head && p.head <= 256 && (p.head & (p.head - 1)) == 0 && p.value_heads % p.key_heads == 0, "gated delta-net scan requires a power-of-two head size up to 256");
+        require(p.qkv && p.beta && p.alpha && p.dt_bias && p.a && p.state && p.output, "gdn_scan plan has a null buffer pointer");
+        kernels::gdn_scan(p, stream(id)); sync_check(id);
+    }
+    void gated_norm(const compute::GatedNormPlan& p, StreamId id) override {
+        require(p.width && p.width <= 256 && (p.width & (p.width - 1)) == 0, "gated normalization requires a power-of-two width up to 256");
+        require(p.input && p.gate && p.weight && p.output, "gated_norm plan has a null buffer pointer");
+        kernels::gated_norm(p, stream(id)); sync_check(id);
+    }
+    KNJ_HIP_OP(sigmoid_gate, SigmoidGatePlan)
 #undef KNJ_HIP_OP
 };
 }

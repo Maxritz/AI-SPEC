@@ -552,10 +552,14 @@ void Model::import_recurrent_state(RecurrentState& target, const std::vector<uin
 }
 void Model::tune(Autotuner& tuner, const std::string& mode, bool allow_wmma) {
     if (!runtime_.backend().caps().is_gpu) return;
-    const auto& info = *index_.find_tensor_info("blk.0.attn_output.weight"); uint32_t rows = std::min(32u, tensor(info.name).matrix.rows), cols = tensor(info.name).matrix.cols; auto source = tensor::read_bytes(info.payload_path(index_.path), info.abs_offset, uint64_t(rows) * cols / decode::block_elements(info.type) * decode::block_bytes(info.type));
-    std::vector<float> x(cols); for (uint32_t i = 0; i < cols; ++i) x[i] = std::sin(float(i)) * .1f; std::vector<float> reference(rows); compute::matmul({{source.data(), rows, cols, info.type}, x.data(), reference.data(), nullptr, 1});
+    const gguf::TensorInfo* info = nullptr;
+    for (uint32_t layer = 0; layer < spec_.total_layers; ++layer) { info = index_.find_tensor_info("blk." + std::to_string(layer) + ".attn_output.weight"); if (info) break; }
+    if (!info) info = index_.find_tensor_info("blk.0.ffn_up.weight");  // recurrent layers: fall back to any dense weight
+    require(info, "cannot find a dense weight tensor for matmul tuning");
+    uint32_t rows = std::min(32u, tensor(info->name).matrix.rows), cols = tensor(info->name).matrix.cols; auto source = tensor::read_bytes(info->payload_path(index_.path), info->abs_offset, uint64_t(rows) * cols / decode::block_elements(info->type) * decode::block_bytes(info->type));
+    std::vector<float> x(cols); for (uint32_t i = 0; i < cols; ++i) x[i] = std::sin(float(i)) * .1f; std::vector<float> reference(rows); compute::matmul({{source.data(), rows, cols, info->type}, x.data(), reference.data(), nullptr, 1});
     auto host = runtime_.backend().allocate(cols * 4, device::MemoryKind::Pageable), input = runtime_.backend().allocate(host.bytes), output = runtime_.backend().allocate(rows * 4), result = runtime_.backend().allocate(output.bytes, device::MemoryKind::Pageable); std::memcpy(host.data, x.data(), host.bytes); runtime_.copy(input, host, device::CopyKind::H2D)->wait();
-    auto measure = [&](uint32_t variant, bool validate) { compute::MatmulPlan p{tensor(info.name).matrix, input.as<float>(), output.as<float>(), nullptr, 1, variant}; p.weight.rows = rows; auto t = runtime_.submit({profile::OpClass::Projection, runtime_.compute_stream(), [p](device::Backend& b, auto s) { b.matmul(p, s); }, {}, {input.owner, output.owner}, 0, "startup-full-output-probe", true}); t->wait(); double us = runtime_.backend().event_pair_us(t->start, t->event);
+    auto measure = [&](uint32_t variant, bool validate) { compute::MatmulPlan p{tensor(info->name).matrix, input.as<float>(), output.as<float>(), nullptr, 1, variant}; p.weight.rows = rows; auto t = runtime_.submit({profile::OpClass::Projection, runtime_.compute_stream(), [p](device::Backend& b, auto s) { b.matmul(p, s); }, {}, {input.owner, output.owner}, 0, "startup-full-output-probe", true}); t->wait(); double us = runtime_.backend().event_pair_us(t->start, t->event);
         if (validate) { runtime_.copy(result, output, device::CopyKind::D2H, {t})->wait(); for (uint32_t i = 0; i < rows; ++i) if (!std::isfinite(result.as<float>()[i]) || std::abs(result.as<float>()[i] - reference[i]) > .001f + .03f * std::abs(reference[i])) { runtime_.poll(); return -1.0; } } runtime_.poll(); return std::max(.001, us); };
     auto probe = [&](uint32_t v) { return TuningVariant{v, [&, v] { return measure(v, true) > 0; }, [&, v] { return measure(v, false); }}; };
     std::vector<TuningVariant> variants;
@@ -564,7 +568,7 @@ void Model::tune(Autotuner& tuner, const std::string& mode, bool allow_wmma) {
     else if (mode == "dot4") variants = {probe(1)};
     else if (mode == "wmma") { require(runtime_.backend().caps().has_wmma, "gpu.matmul=\"wmma\" requested but this device reports no WMMA"); variants = {probe(2)}; }
     else { variants = {probe(0), probe(3)}; if (allow_wmma && runtime_.backend().caps().has_wmma) variants.push_back(probe(2)); }
-    TuningKey key{"dense-matmul", index_.fingerprint + ":" + std::to_string(info.type) + ":" + mode + (allow_wmma ? "|w" : ""), 1, rows, cols};
+    TuningKey key{"dense-matmul", index_.fingerprint + ":" + std::to_string(info->type) + ":" + mode + (allow_wmma ? "|w" : ""), 1, rows, cols};
     tuner.calibrate(key, variants, 5); variant_ = tuner.pick(key)->variant;
 }
 }  // namespace knj::model

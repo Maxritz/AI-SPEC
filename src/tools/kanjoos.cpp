@@ -136,51 +136,94 @@ void apply_drafter(const Args& a, knj::Config& config) {
     if (a.values.count("--draft-p-min")) config.draft_p_min = std::stod(a.get("--draft-p-min"));
 }
 
+bool is_gpu_crash(const std::exception& e) {
+    const knj::Error* err = dynamic_cast<const knj::Error*>(&e);
+    return err && err->code() == knj::ErrorCode::Device;
+}
+
+struct GpuCrash : knj::Error {
+    GpuCrash(const std::string& msg) : knj::Error(knj::ErrorCode::Device, msg) {}
+};
+
+#if defined(_MSC_VER) && defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <eh.h>
+void __cdecl seh_to_cpp(unsigned int code, struct _EXCEPTION_POINTERS*) {
+    throw GpuCrash("GPU access violation (0x" + std::to_string(code) + ") during kernel execution");
+}
+struct SehGuard {
+    _se_translator_function prev;
+    SehGuard() { prev = _set_se_translator(seh_to_cpp); }
+    ~SehGuard() { _set_se_translator(prev); }
+};
+#define SEH_GUARD SehGuard seh_guard_;
+#else
+#define SEH_GUARD
+#endif
+
 int cmd_generate(int argc, char** argv) {
+    SEH_GUARD
     Args a = parse(argc, argv, 2, {"--stream", "--json", "--no-speculate", "--rebuild-store"});
     require(a.values.count("--model"), "generate needs --model");
     knj::Config config = load_config(a);
     config.rebuild_stale_store = config.rebuild_stale_store || a.has("--rebuild-store");
     apply_drafter(a, config);
-    knj::inference::Engine engine(a.get("--model"), config);
     auto options = options_from(a, config);
-    auto prompt = prompt_tokens(a, engine.tokenizer());
-    auto g = engine.create(prompt, options);
     const bool stream = a.has("--stream");
     const auto started = std::chrono::steady_clock::now();
-    std::string pending; size_t sent = 0;
-    while (!g->done) {
-        engine.step(*g);
-        if (!stream) { continue; }
-        size_t hold = 0;
-        for (const auto& s : options.stop) { hold = std::max(hold, s.size() - 1); }
-        size_t limit = g->done ? g->text.size() : (g->text.size() > hold ? g->text.size() - hold : 0);
-        if (limit > sent) {
-            size_t consumed = 0;
-            std::string window = g->text.substr(sent, limit - sent);
-            std::cout << knj::inference::utf8(window, g->done, &consumed) << std::flush;
-            sent += consumed;
-        }
-    }
-    if (stream) {
-        size_t consumed = 0;
-        std::string tail = sent < g->text.size() ? g->text.substr(sent) : std::string();
-        std::cout << knj::inference::utf8(tail, true, &consumed) << "\n";
-    }
-    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-    if (a.has("--json")) {
-        json tokens = json::array();
-        for (auto t : g->output) { tokens.push_back(t); }
-        json result = {{"text", knj::inference::utf8(g->text)}, {"tokens", tokens}, {"finish_reason", g->finish_reason}, {"prompt_tokens", g->prompt.size()}, {"reused_tokens", g->reused}, {"seconds", seconds}};
-        std::cout << result.dump(2) << "\n";
-    } else if (!stream) {
-        std::cout << knj::inference::utf8(g->text) << "\n";
-    }
-    std::cerr << "kanjoos: " << g->output.size() << " tokens, finish=" << g->finish_reason << ", " << (seconds > 0 ? g->output.size() / seconds : 0.0) << " tok/s overall\n";
-    if ((engine.has_mtp() || engine.has_drafter()) && options.speculate) { std::cerr << "kanjoos: speculation " << engine.report()["speculation"].dump() << "\n"; }
-    return 0;
-}
+    size_t sent = 0;
 
+    auto run_with_config = [&](const knj::Config& cfg) -> int {
+        knj::inference::Engine engine(a.get("--model"), cfg);
+        auto prompt = prompt_tokens(a, engine.tokenizer());
+        auto g = engine.create(prompt, options);
+        while (!g->done) {
+            engine.step(*g);
+            if (!stream) { continue; }
+            size_t hold = 0;
+            for (const auto& s : options.stop) { hold = std::max(hold, s.size() - 1); }
+            size_t limit = g->done ? g->text.size() : (g->text.size() > hold ? g->text.size() - hold : 0);
+            if (limit > sent) {
+                size_t consumed = 0;
+                std::string window = g->text.substr(sent, limit - sent);
+                std::cout << knj::inference::utf8(window, g->done, &consumed) << std::flush;
+                sent += consumed;
+            }
+        }
+        if (stream) {
+            size_t consumed = 0;
+            std::string tail = sent < g->text.size() ? g->text.substr(sent) : std::string();
+            std::cout << knj::inference::utf8(tail, true, &consumed) << "\n";
+        }
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        if (a.has("--json")) {
+            json tokens = json::array();
+            for (auto t : g->output) { tokens.push_back(t); }
+            json result = {{"text", knj::inference::utf8(g->text)}, {"tokens", tokens}, {"finish_reason", g->finish_reason}, {"prompt_tokens", g->prompt.size()}, {"reused_tokens", g->reused}, {"seconds", seconds}};
+            std::cout << result.dump(2) << "\n";
+        } else if (!stream) {
+            std::cout << knj::inference::utf8(g->text) << "\n";
+        }
+        std::cerr << "kanjoos: " << g->output.size() << " tokens, finish=" << g->finish_reason << ", " << (seconds > 0 ? g->output.size() / seconds : 0.0) << " tok/s overall\n";
+        if ((engine.has_mtp() || engine.has_drafter()) && options.speculate) { std::cerr << "kanjoos: speculation " << engine.report()["speculation"].dump() << "\n"; }
+        return 0;
+    };
+
+    try {
+        return run_with_config(config);
+    } catch (const std::exception& e) {
+        if (config.backend != "cpu" && is_gpu_crash(e)) {
+            std::cerr << "kanjoos: GPU error during generation (" << e.what() << "); retrying on CPU.\n";
+            config.backend = "cpu";
+            config.wmma = false;
+            sent = 0;
+            return run_with_config(config);
+        }
+        throw;
+    }
+}
 std::atomic<bool> g_interrupted{false};
 extern "C" void on_interrupt(int) { g_interrupted.store(true); }
 
@@ -409,9 +452,8 @@ int cmd_bench(int argc, char** argv) {
     const auto index = knj::gguf::load_model_index(path);
     json modes = json::object();
     json source, host;
-    auto measure_mode = [&](const std::string& mode, bool with_drafter) {
-        knj::Config config = load_config(a);
-        config.use_prefix_cache = false;  // every run prefills its prompt, so prefill throughput is measured
+    auto measure_mode = [&](const std::string& mode, bool with_drafter, knj::Config config) {
+        config.use_prefix_cache = false;
         if (with_drafter) apply_drafter(a, config);
         else { config.drafter = ""; config.drafter_path.clear(); }
         knj::inference::Engine engine(path, config);
@@ -422,8 +464,22 @@ int cmd_bench(int argc, char** argv) {
         modes[mode] = summarise_runs(runs, engine, with_drafter);
         if (source.is_null()) { source = source_block(path, index, engine); host = host_block(engine, config); }
     };
-    measure_mode("plain", false);
-    if (a.values.count("--drafter")) measure_mode("drafter", true);
+    knj::Config base_config = load_config(a);
+    try {
+        measure_mode("plain", false, base_config);
+        if (a.values.count("--drafter")) measure_mode("drafter", true, base_config);
+    } catch (const std::exception& e) {
+        if (base_config.backend != "cpu" && is_gpu_crash(e)) {
+            std::cerr << "kanjoos: GPU error during bench (" << e.what() << "); retrying on CPU.\n";
+            base_config.backend = "cpu";
+            base_config.wmma = false;
+            modes = json::object(); source = json::object(); host = json::object();
+            measure_mode("plain", false, base_config);
+            if (a.values.count("--drafter")) measure_mode("drafter", true, base_config);
+        } else {
+            throw;
+        }
+    }
     json out = {{"schema", "kanjoos.bench/1"},
                 {"source", source},
                 {"host", host},
@@ -494,13 +550,14 @@ int cmd_ppl(int argc, char** argv) {
 int main(int argc, char** argv) {
     if (argc < 2) { usage(std::cerr); return 2; }
     std::string command = argv[1];
+    SEH_GUARD
     try {
         if (command == "generate") { return cmd_generate(argc, argv); }
         if (command == "serve") { return cmd_serve(argc, argv); }
         if (command == "doctor") { return cmd_doctor(argc, argv); }
         if (command == "bench") { return cmd_bench(argc, argv); }
         if (command == "ppl") { return cmd_ppl(argc, argv); }
-        if (command == "--help" || command == "-h" || command == "help") { usage(std::cout); return 0; }
+            if (command == "--help" || command == "-h" || command == "help") { usage(std::cout); return 0; }
         std::cerr << "kanjoos: unknown command " << command << "\n";
         usage(std::cerr);
         return 2;
