@@ -1,0 +1,16 @@
+  kanjoos 0.2.0   AMD Radeon RX 9070 XT
+                 arch gfx1201   driver 71260602/71260602   gpu_timing yes
+     component           ops   %dev      dev us     idle us     host us
+     projections          7168  69.6%  6203683.47    38692.72      450.70
+     head+sample            32  12.8%  1136681.81       76.14        9.09
+     transfer             1770  11.5%  1021580.61  9070598.58   196327.13
+     attention-mix         896   2.4%   216228.01     2403.21      381.75
+     kv-write              924   1.5%   130975.71  8547721.82     2412.99
+     attention             896   1.2%   110502.50   265119.09     3580.95
+     norms                1824   1.0%    88272.16   137600.13     1986.39
+     embed                  32   0.0%     2217.60   452045.48      642.29
+     ffn-activate          896   0.0%        0.00     2643.53      238.35 *
+     residual             1792   0.0%        0.00     5816.92        0.00 *
+   instrumentation floor, 256 empty ops timed through the same begin/end path: 2.4878906250000097 us host, 4.28363275577226 us device each.
+  counters {"cancelled":0,"cpu_fallback":0,"cpu_fallback_us":0.0,"d2h_bytes":20025344,"expert_hit":0,"expert_miss":0,"full_fences":0,"h2d_bytes":1153334064,"kv_recompute":0,"kv_reload":0,"nvme_read_bytes":1110790656,"nvme_write_bytes":0,"peak_pinned_bytes":2097152,"prefetch_used":0,"prefetch_waste_bytes":0,"prefix_tokens":0,"slot_evictions":0,"stall_us":0.0}
+  latency  {"p50":118315.2,"p95":121972.7,"p99":122362.6,"samples":32,"unit":"us_per_step"}

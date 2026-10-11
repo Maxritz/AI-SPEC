@@ -4,7 +4,7 @@ namespace knj::compute {
 // All strides/counts are elements except KV byte offsets. A plan is a POD and
 // may be copied to device memory. Owner handles live in Runtime::Op, not here.
 struct Matrix { const uint8_t* data = nullptr; uint32_t rows = 0, cols = 0, type = 0; };
-struct MatmulPlan { Matrix weight; const float* input = nullptr; float* output = nullptr; const float* bias = nullptr; uint32_t tokens = 0; uint32_t variant = 0; };
+struct MatmulPlan { Matrix weight; const float* input = nullptr; float* output = nullptr; const float* bias = nullptr; uint32_t tokens = 0; uint32_t variant = 0; const float* residual = nullptr; const float* rms_norm = nullptr; float rms_epsilon = 1e-5f; };
 struct NormPlan { const float* input = nullptr; float* output = nullptr; const float* weight = nullptr; const float* bias = nullptr; uint32_t rows = 0, cols = 0; float epsilon = 1e-5f; bool layer_norm = false; bool add_one = false; };
 enum class Activation : uint32_t { Silu = 0, Gelu = 1, Relu = 2, Sigmoid = 3 };
 struct ActivationPlan { const float* gate = nullptr; const float* up = nullptr; float* output = nullptr; uint64_t elements = 0; Activation kind = Activation::Silu; };
@@ -57,6 +57,9 @@ void attention(const AttentionPlan&);
 void attention_init(const AttentionPlan&);
 void attention_page(const AttentionPagePlan&);
 void attention_finish(const AttentionPlan&);
+// Fused QKV: one matmul reads `input` and writes Q rows then interleaved KV to their outputs.
+struct QkvPlan { Matrix q_weight, k_weight, v_weight; const float* input = nullptr; float* q_out = nullptr; float* k_out = nullptr; float* v_out = nullptr; const float* bias = nullptr; uint32_t tokens = 0, variant = 0, q_rows = 0, kv_rows = 0; const float* rms_norm = nullptr; float rms_epsilon = 1e-5f; const float* k_bias = nullptr; const float* v_bias = nullptr; };
+void qkv(const QkvPlan&);
 // Gated DeltaNet (linear attention) plans. Layouts are row-major f32 per token.
 // ConvPlan: depthwise causal convolution over channels with a (kernel-1)-row history
 //   (oldest row first) that is read and rewritten in place; the output has SiLU applied.

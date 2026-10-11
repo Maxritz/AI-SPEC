@@ -62,6 +62,11 @@ inline Dims family(const std::string& arch) {
     Dims d;
     d.arch = arch;
     if (arch == "qwen3moe") return d;
+    if (arch == "qwen3") {  // dense Qwen3: per-head QK norm, no attention biases, dense FFN everywhere
+        d.experts = 0; d.used = 0;
+        d.dense_layers = d.layers; d.dense_ff = d.ff;
+        return d;
+    }
     if (arch == "qwen2") {  // dense Qwen2: attention biases, no QK norm, dense FFN everywhere
         d.qkv_bias = true; d.qk_norm = QkNorm::None; d.experts = 0; d.used = 0;
         d.dense_layers = d.layers; d.dense_ff = d.ff;

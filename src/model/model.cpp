@@ -238,7 +238,8 @@ Result Model::run(kv::Session& session, kv::Cache& cache, attn::Attention& attn,
     ensure_staging(stage_tokens_, uint64_t(n) * 8); auto token_host = stage_tokens_.slice(0, uint64_t(n) * 8), token_device = frame.take(uint64_t(n) * 8); std::memcpy(token_host.data, tokens.data(), n * 4); for (uint32_t t = 0; t < n; ++t) token_host.as<int32_t>()[n + t] = int32_t(start + t);
     auto uploaded = runtime_.copy(token_device, token_host, device::CopyKind::H2D); auto positions = token_device.slice(n * 4, n * 4); std::vector<std::shared_ptr<void>> keep{workspace_.owner, token_device.owner};
     auto submit = [&](profile::OpClass cls, auto plan, auto function, std::vector<Ticket> deps, uint32_t layer, const std::string& name, device::StreamId stream) { return runtime_.submit({cls, stream, [plan, function](device::Backend& b, auto s) { (b.*function)(plan, s); }, std::move(deps), keep, layer, name}); };
-    auto mat = [&](const std::string& name, device::Buffer in, device::Buffer out, uint32_t count, Ticket dep, profile::OpClass cls, uint32_t layer) { const auto& w = tensor(name); MatmulPlan p{w.matrix, in.as<float>(), out.as<float>(), nullptr, count, variant_}; std::string bias = name.substr(0, name.size() - 6) + "bias"; if (has(bias)) p.bias = tensor(bias).buffer.as<float>(); return submit(cls, p, &device::Backend::matmul, {dep}, layer, "dense-matmul-v" + std::to_string(variant_) + "-t" + std::to_string(w.matrix.type) + "-" + std::to_string(w.matrix.rows) + "x" + std::to_string(w.matrix.cols), runtime_.compute_stream()); };
+    auto mat = [&](const std::string& name, device::Buffer in, device::Buffer out, uint32_t count, Ticket dep, profile::OpClass cls, uint32_t layer, device::Buffer residual = {}, device::Buffer rms_norm = {}) { const auto& w = tensor(name); MatmulPlan p{w.matrix, in.as<float>(), out.as<float>(), nullptr, count, variant_}; p.residual = residual ? residual.as<float>() : nullptr; p.rms_norm = rms_norm ? rms_norm.as<float>() : nullptr; p.rms_epsilon = spec_.epsilon; std::string bias = name.substr(0, name.size() - 6) + "bias"; if (has(bias)) p.bias = tensor(bias).buffer.as<float>(); return submit(cls, p, &device::Backend::matmul, {dep}, layer, "dense-matmul-v" + std::to_string(variant_) + "-t" + std::to_string(w.matrix.type) + "-" + std::to_string(w.matrix.rows) + "x" + std::to_string(w.matrix.cols), runtime_.compute_stream()); };
+    auto qkv = [&](const std::string& qn, const std::string& kn, const std::string& vn, device::Buffer in, device::Buffer rms_w, device::Buffer q, device::Buffer k, device::Buffer v, Ticket dep, uint32_t layer) { const auto& qw = tensor(qn); const auto& kw = tensor(kn); const auto& vw = tensor(vn); QkvPlan p{qw.matrix, kw.matrix, vw.matrix, in.as<float>(), q.as<float>(), k.as<float>(), v.as<float>(), nullptr, n, variant_}; p.q_rows = qw.matrix.rows; p.kv_rows = kw.matrix.rows; p.rms_norm = rms_w ? rms_w.as<float>() : nullptr; p.rms_epsilon = spec_.epsilon; if (has(qn.substr(0, qn.size() - 6) + "bias")) p.bias = tensor(qn.substr(0, qn.size() - 6) + "bias").buffer.as<float>(); if (has(kn.substr(0, kn.size() - 6) + "bias")) p.k_bias = tensor(kn.substr(0, kn.size() - 6) + "bias").buffer.as<float>(); if (has(vn.substr(0, vn.size() - 6) + "bias")) p.v_bias = tensor(vn.substr(0, vn.size() - 6) + "bias").buffer.as<float>(); return submit(profile::OpClass::Projection, p, &device::Backend::qkv, {dep}, layer, "fused-qkv-v1-t" + std::to_string(qw.matrix.type) + "-q" + std::to_string(qw.matrix.rows) + "x" + std::to_string(kw.matrix.rows), runtime_.compute_stream()); };
     auto norm = [&](device::Buffer in, device::Buffer out, const std::string& name, uint32_t rows, uint32_t cols, Ticket dep, uint32_t layer) { NormPlan p{in.as<float>(), out.as<float>(), tensor(name).buffer.as<float>(), nullptr, rows, cols, spec_.epsilon}; return submit(profile::OpClass::Norm, p, &device::Backend::norm, {dep}, layer, "rmsnorm-v1", runtime_.compute_stream()); };
     // QK RMS norm. Full-width weights (OLMoE, MiniMax-M2) normalise each token's whole Q or K vector;
     // per-head weights (Qwen3) normalise each head separately.
@@ -283,7 +284,9 @@ Result Model::run(kv::Session& session, kv::Cache& cache, attn::Attention& attn,
             }
             if (activation) { activation->predict(asked); }
         }
-        last = norm(x, normed, prefix + "attn_norm.weight", n, h, last, layer); Ticket qdone, kdone, gate_done;
+        const bool fused_qkv = !spec_.mla && !spec_.recurrent[layer] && !seed && !spec_.gated_q;
+        if (!fused_qkv) last = norm(x, normed, prefix + "attn_norm.weight", n, h, last, layer);
+        Ticket qdone, kdone, gate_done;
         if (spec_.recurrent[layer] && !seed) {
             // Gated DeltaNet (linear attention): joint QKV mix, causal depthwise conv over the conv
             // history, the decay/delta recurrence over the per-value-head state, and a gated RMS norm.
@@ -323,9 +326,19 @@ Result Model::run(kv::Session& session, kv::Cache& cache, attn::Attention& attn,
                 kdone = qk_norm(k, kwidth, prefix + "attn_k_norm.weight", kdone, layer);
                 gate_done = rearrange({extra.as<float>(), extra2.as<float>(), n, spec_.heads, spec_.key_dim, 2ull * qwidth, 2ull * spec_.key_dim, qwidth, uint64_t(spec_.key_dim), spec_.key_dim, 0}, qg_done, layer);
             } else {
-                qdone = mat(prefix + "attn_q.weight", normed, q, n, last, profile::OpClass::Projection, layer); kdone = mat(prefix + "attn_k.weight", normed, k, n, last, profile::OpClass::Projection, layer); last = mat(prefix + "attn_v.weight", normed, v, n, last, profile::OpClass::Projection, layer);
-                if (has(prefix + "attn_q_norm.weight")) qdone = qk_norm(q, qwidth, prefix + "attn_q_norm.weight", qdone, layer);
-                if (has(prefix + "attn_k_norm.weight")) kdone = qk_norm(k, kwidth, prefix + "attn_k_norm.weight", kdone, layer);
+                if (fused_qkv) {
+                    qdone = qkv(prefix + "attn_q.weight", prefix + "attn_k.weight", prefix + "attn_v.weight", x, tensor(prefix + "attn_norm.weight").buffer, q, k, v, last, layer);
+                    kdone = qdone;
+                    if (has(prefix + "attn_q_norm.weight")) qdone = qk_norm(q, qwidth, prefix + "attn_q_norm.weight", qdone, layer);
+                    if (has(prefix + "attn_k_norm.weight")) kdone = qk_norm(k, kwidth, prefix + "attn_k_norm.weight", kdone, layer);
+                    last = qdone;
+                } else {
+                    qdone = mat(prefix + "attn_q.weight", normed, q, n, last, profile::OpClass::Projection, layer);
+                    kdone = mat(prefix + "attn_k.weight", normed, k, n, last, profile::OpClass::Projection, layer);
+                    last = mat(prefix + "attn_v.weight", normed, v, n, last, profile::OpClass::Projection, layer);
+                    if (has(prefix + "attn_q_norm.weight")) qdone = qk_norm(q, qwidth, prefix + "attn_q_norm.weight", qdone, layer);
+                    if (has(prefix + "attn_k_norm.weight")) kdone = qk_norm(k, kwidth, prefix + "attn_k_norm.weight", kdone, layer);
+                }
             }
         } else {
             if (spec_.q_rank) { qdone = mat(prefix + "attn_q_a.weight", normed, extra2, n, last, profile::OpClass::Projection, layer); qdone = norm(extra2, extra2, prefix + "attn_q_a_norm.weight", n, spec_.q_rank, qdone, layer); qdone = mat(prefix + "attn_q_b.weight", extra2, q, n, qdone, profile::OpClass::Projection, layer); }
@@ -355,13 +368,13 @@ Result Model::run(kv::Session& session, kv::Cache& cache, attn::Attention& attn,
         }
         last = attn.run(session, cache_layer, q, positions, n, spec_.heads, spec_.key_dim, a, std::move(writes), spec_.windows[layer]);
         if (spec_.gated_q) last = submit(profile::OpClass::AttnMix, SigmoidGatePlan{a.as<float>(), extra2.as<float>(), uint64_t(n) * spec_.heads * spec_.value_dim}, &device::Backend::sigmoid_gate, {last, gate_done}, layer, "attn-output-gate-v1", runtime_.compute_stream());
-        last = mat(prefix + "attn_output.weight", a, mix, n, last, profile::OpClass::AttnMix, layer); last = add(x, mix, y, last, layer);
+        last = mat(prefix + "attn_output.weight", a, y, n, last, profile::OpClass::AttnMix, layer, x);
         }
         last = norm(y, normed, ffn_norm_name(prefix), n, h, last, layer);
         bool moe = has(prefix + "ffn_gate_inp.weight");
-        auto dense_ffn = [&](const std::string& suffix, device::Buffer out, Ticket dependency) {
+        auto dense_ffn = [&](const std::string& suffix, device::Buffer out, Ticket dependency, device::Buffer residual = {}) {
             const auto& w = tensor(prefix + "ffn_up" + suffix + ".weight"); uint32_t width = w.matrix.rows; require(width <= ff, "FFN exceeds reserved shape"); auto gdone = mat(prefix + "ffn_gate" + suffix + ".weight", normed, gate, n, dependency, profile::OpClass::Projection, layer); auto udone = mat(prefix + "ffn_up" + suffix + ".weight", normed, up, n, dependency, profile::OpClass::Projection, layer);
-            auto act = submit(profile::OpClass::FFNAct, ActivationPlan{gate.as<float>(), up.as<float>(), activated.as<float>(), uint64_t(n) * width, spec_.activation}, &device::Backend::activation, {gdone, udone}, layer, "ffn-activation-v1", runtime_.compute_stream()); return mat(prefix + "ffn_down" + suffix + ".weight", activated, out, n, act, profile::OpClass::Projection, layer);
+            auto act = submit(profile::OpClass::FFNAct, ActivationPlan{gate.as<float>(), up.as<float>(), activated.as<float>(), uint64_t(n) * width, spec_.activation}, &device::Backend::activation, {gdone, udone}, layer, "ffn-activation-v1", runtime_.compute_stream()); return mat(prefix + "ffn_down" + suffix + ".weight", activated, out, n, act, profile::OpClass::Projection, layer, residual);
         };
         if (moe) {
             require(experts_, "MoE layer has no residency/executor"); auto routed = mat(prefix + "ffn_gate_inp.weight", normed, route_logits, n, last, profile::OpClass::Router, layer);
@@ -383,9 +396,8 @@ Result Model::run(kv::Session& session, kv::Cache& cache, attn::Attention& attn,
                 if (has(prefix + "ffn_gate_inp_shexp.weight")) { shared_done = mat(prefix + "ffn_gate_inp_shexp.weight", normed, extra, n, shared_done, profile::OpClass::Projection, layer); shared_done = rearrange({extra.as<float>(), extra2.as<float>(), n, h, 1, 1, 0, h, 1}, shared_done, layer); shared_done = submit(profile::OpClass::FFNAct, ActivationPlan{extra2.as<float>(), shared.as<float>(), shared.as<float>(), uint64_t(n) * h, Activation::Sigmoid}, &device::Backend::activation, {shared_done}, layer, "shared-expert-gate-v1", runtime_.compute_stream()); }
                 last = add(ffnout, shared, ffnout, shared_done, layer);
             }
-        } else last = dense_ffn("", ffnout, last);
-        last = add(y, ffnout, x, last, layer);
-
+            last = add(y, ffnout, x, last, layer);
+        } else last = dense_ffn("", x, last, y);
         runtime_.poll();
     }
     if (activation) { activation->fold(); }  // this iteration joins the request's own reuse history

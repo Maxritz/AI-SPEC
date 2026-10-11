@@ -49,6 +49,7 @@ public:
     virtual void zero(void*, uint64_t bytes, StreamId) = 0;
     virtual void empty(StreamId) = 0;
     virtual void matmul(const compute::MatmulPlan&, StreamId) = 0;
+    virtual void qkv(const compute::QkvPlan&, StreamId) = 0;
     virtual void norm(const compute::NormPlan&, StreamId) = 0;
     virtual void activation(const compute::ActivationPlan&, StreamId) = 0;
     virtual void add(const compute::AddPlan&, StreamId) = 0;

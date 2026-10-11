@@ -55,7 +55,13 @@ __global__ void caps_kernel(uint32_t* p) {
 __global__ void matmul_simt(MatmulPlan p) {
     uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; if (i >= uint64_t(p.tokens) * p.weight.rows) return;
     uint32_t t = uint32_t(i / p.weight.rows), row = uint32_t(i % p.weight.rows);
-    p.output[i] = dot(p.weight, row, p.input + uint64_t(t) * p.weight.cols, p.variant == 1) + (p.bias ? p.bias[row] : 0);
+    const float* xt = p.input + uint64_t(t) * p.weight.cols;
+    float inv = 1.0f;
+    if (p.rms_norm) { float sum = 0; for (uint32_t k = 0; k < p.weight.cols; ++k) sum += xt[k] * xt[k]; inv = 1.0f / sqrtf(sum / float(p.weight.cols) + p.rms_epsilon); }
+    float acc;
+    if (p.rms_norm) { acc = 0; for (uint32_t k = 0; k < p.weight.cols; ++k) acc += (xt[k] * inv * p.rms_norm[k]) * decode::weight(p.weight.type, p.weight.data, uint64_t(row) * p.weight.cols + k); }
+    else { acc = dot(p.weight, row, xt, p.variant == 1); }
+    p.output[i] = acc + (p.bias ? p.bias[row] : 0) + (p.residual ? p.residual[i] : 0);
 }
 __global__ void matmul_wmma(MatmulPlan p) {
 #if defined(__gfx1201__) && __has_builtin(__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12)
@@ -73,12 +79,12 @@ __global__ void matmul_wmma(MatmulPlan p) {
         }
         acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, acc);
     }
-    for (uint32_t j = 0; j < 8; ++j) { uint32_t r = r0 + (lane / 16) * 8 + j, t = t0 + lane % 16; if (r < p.weight.rows && t < p.tokens) p.output[uint64_t(t) * p.weight.rows + r] = acc[j] + (p.bias ? p.bias[r] : 0); }
+    for (uint32_t j = 0; j < 8; ++j) { uint32_t r = r0 + (lane / 16) * 8 + j, t = t0 + lane % 16; if (r < p.weight.rows && t < p.tokens) p.output[uint64_t(t) * p.weight.rows + r] = acc[j] + (p.bias ? p.bias[r] : 0) + (p.residual ? p.residual[uint64_t(t) * p.weight.rows + r] : 0); }
 #else
     // The gfx1031 code object always contains the SIMT path. The backend
     // refuses a requested WMMA variant on this architecture before launch.
     uint32_t lane = threadIdx.x & 31;
-    for (uint32_t j = 0; j < 8; ++j) { uint32_t row = blockIdx.x * 16 + (lane / 16) * 8 + j, token = blockIdx.y * 16 + lane % 16; if (row < p.weight.rows && token < p.tokens) p.output[uint64_t(token) * p.weight.rows + row] = dot(p.weight, row, p.input + uint64_t(token) * p.weight.cols, false) + (p.bias ? p.bias[row] : 0); }
+    for (uint32_t j = 0; j < 8; ++j) { uint32_t row = blockIdx.x * 16 + (lane / 16) * 8 + j, token = blockIdx.y * 16 + lane % 16; if (row < p.weight.rows && token < p.tokens) p.output[uint64_t(token) * p.weight.rows + row] = dot(p.weight, row, p.input + uint64_t(token) * p.weight.cols, false) + (p.bias ? p.bias[row] : 0) + (p.residual ? p.residual[uint64_t(token) * p.weight.rows + row] : 0); }
 #endif
 }
 // E1: sub-block constant hoist for matmul_staged. ab() fills (A, M) for
@@ -135,6 +141,12 @@ __global__ void matmul_gemv_t(MatmulPlan p) {
     const uint32_t cols = p.weight.cols;
     const uint8_t* w = p.weight.data;
     float acc = 0;
+    float inv = 1.0f;
+    if (p.rms_norm) {
+        float sum = 0;
+        for (uint32_t k = 0; k < cols; ++k) sum += x[k] * x[k];
+        inv = 1.0f / sqrtf(sum / float(cols) + p.rms_epsilon);
+    }
     if (T == 12 || T == 13) {
         constexpr uint32_t bb = T == 12 ? 144 : 176, qoff = T == 12 ? 16 : 48;
         const uint8_t* wp = w; float d = 0, dm = 0, a[8] = {}, m[8] = {};
@@ -148,7 +160,8 @@ __global__ void matmul_gemv_t(MatmulPlan p) {
             }
             uint32_t q = (wp[qoff + (i >> 6) * 32 + j] >> (((i & 63) >> 5) * 4)) & 15;
             if (T == 13 && (wp[16 + j] & (1u << s))) q += 16;
-            acc += x[k] * (a[s] * float(q) - m[s]);
+            float xn = p.rms_norm ? x[k] * inv * p.rms_norm[k] : x[k];
+            acc += xn * (a[s] * float(q) - m[s]);
         }
     } else if (T == 14) {
         const uint8_t* wp = w; float d = 0, a16 = 0;
@@ -158,7 +171,8 @@ __global__ void matmul_gemv_t(MatmulPlan p) {
             if ((i & 15) == 0) a16 = d * float(int8_t(wp[192 + (i >> 4)]));
             const uint32_t n = i >> 7, jj = i & 127;
             int q = int((wp[n * 64 + (jj & 63)] >> (((jj >> 6) & 1) * 4)) & 15) | int(((wp[128 + n * 32 + (jj & 31)] >> ((jj >> 5) * 2)) & 3) << 4);
-            acc += x[k] * (a16 * float(q - 32));
+            float xn = p.rms_norm ? x[k] * inv * p.rms_norm[k] : x[k];
+            acc += xn * (a16 * float(q - 32));
         }
     } else if (T == 10 || T == 11) {
         const uint8_t* wp = w; float d = 0, dm = 0, a = 0, m = 0;
@@ -171,33 +185,32 @@ __global__ void matmul_gemv_t(MatmulPlan p) {
             }
             uint32_t q = (wp[(T == 10 ? 16 : 32) + (i >> 7) * 32 + (i & 31)] >> (((i & 127) >> 5) * 2)) & 3;
             if (T == 11 && !(wp[i & 31] & (1u << (i >> 5)))) q -= 4;
-            acc += x[k] * (T == 10 ? a * float(q) - m : a * float(q));
+            float xn = p.rms_norm ? x[k] * inv * p.rms_norm[k] : x[k];
+            acc += xn * (T == 10 ? a * float(q) - m : a * float(q));
         }
-    } else if (T == 16) {  // kernel-native group quant (T is the sentinel; the real type is p.weight.type)
+    } else if (T == 16) {
         const uint32_t type = p.weight.type, be = decode::block_elements(type), bb = decode::block_bytes(type), bits = type & 255;
         const uint8_t* wp = w; float a = 0, zp = 0;
         for (uint32_t k = 0; k < cols; ++k) {
             if (k % be == 0) { wp = w + (uint64_t(row) * cols + k) / be * bb; a = decode::half(decode::u16(wp)); zp = float(int(wp[2])); }
             const uint32_t j = k % be, bit = j * bits;
             uint32_t q = (wp[3 + (bit >> 3)] | (uint32_t(wp[4 + (bit >> 3)]) << 8)) >> (bit & 7) & ((1u << bits) - 1);
-            acc += x[k] * (a * float(int(q) - int(zp)));
+            float xn = p.rms_norm ? x[k] * inv * p.rms_norm[k] : x[k];
+            acc += xn * (a * float(int(q) - int(zp)));
         }
-    } else if (T == 0) {  // F32: direct float read, no decode machinery
+    } else if (T == 0) {
         const float* fp = reinterpret_cast<const float*>(w);
-        for (uint32_t k = 0; k < cols; ++k) acc += x[k] * fp[uint64_t(row) * cols + k];
-    } else if (T == 1) {  // F16: direct uint16 read + half expansion
+        for (uint32_t k = 0; k < cols; ++k) { float xn = p.rms_norm ? x[k] * inv * p.rms_norm[k] : x[k]; acc += xn * fp[uint64_t(row) * cols + k]; }
+    } else if (T == 1) {
         const uint16_t* hp = reinterpret_cast<const uint16_t*>(w);
-        for (uint32_t k = 0; k < cols; ++k) acc += x[k] * decode::half(hp[uint64_t(row) * cols + k]);
-    } else if (T == 30) {  // BF16: direct uint16 read + bit-shift to f32
+        for (uint32_t k = 0; k < cols; ++k) { float xn = p.rms_norm ? x[k] * inv * p.rms_norm[k] : x[k]; acc += xn * decode::half(hp[uint64_t(row) * cols + k]); }
+    } else if (T == 30) {
         const uint16_t* bp = reinterpret_cast<const uint16_t*>(w);
-        for (uint32_t k = 0; k < cols; ++k) acc += x[k] * decode::from_bits(uint32_t(bp[uint64_t(row) * cols + k]) << 16);
+        for (uint32_t k = 0; k < cols; ++k) { float xn = p.rms_norm ? x[k] * inv * p.rms_norm[k] : x[k]; acc += xn * decode::from_bits(uint32_t(bp[uint64_t(row) * cols + k]) << 16); }
     } else {
-        // Unhandled type at compile time: defer to the plan's runtime type so the
-        // kernel is still correct (per-element div/mod in decode::weight) even though
-        // the dispatcher normally routes such types through matmul_simt instead.
-        for (uint32_t k = 0; k < cols; ++k) acc += x[k] * decode::weight(p.weight.type, w, uint64_t(row) * cols + k);
+        for (uint32_t k = 0; k < cols; ++k) { float xn = p.rms_norm ? x[k] * inv * p.rms_norm[k] : x[k]; acc += xn * decode::weight(p.weight.type, w, uint64_t(row) * cols + k); }
     }
-    p.output[row] = acc + (p.bias ? p.bias[row] : 0);
+    p.output[row] = acc + (p.bias ? p.bias[row] : 0) + (p.residual ? p.residual[row] : 0);
 }
 __global__ void norm_kernel(NormPlan p) {
     __shared__ float mean, inv; uint32_t r = blockIdx.x; const float* x = p.input + uint64_t(r) * p.cols;
@@ -414,6 +427,25 @@ void matmul(const MatmulPlan& p, hipStream_t s) {
     }
     hipLaunchKernelGGL(matmul_simt, dim3(grid(uint64_t(p.tokens) * p.weight.rows)), dim3(threads), 0, s, p);
 }
+__global__ void qkv_kernel(QkvPlan p) {
+    const uint32_t rows_per_token = p.q_rows + 2 * p.kv_rows;
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= uint64_t(p.tokens) * rows_per_token) return;
+    const uint32_t row = idx % rows_per_token;
+    const uint32_t token = idx / rows_per_token;
+    const uint32_t cols = p.q_weight.cols;
+    const float* input = p.input + uint64_t(token) * cols;
+    float* out; uint32_t wrow; const uint8_t* w; uint32_t type; float bias = 0;
+    if (row < p.q_rows) { w = p.q_weight.data; out = p.q_out + uint64_t(token) * p.q_rows; wrow = row; type = p.q_weight.type; if (p.bias) bias = p.bias[wrow]; }
+    else if (row < p.q_rows + p.kv_rows) { w = p.k_weight.data; out = p.k_out + uint64_t(token) * p.kv_rows; wrow = row - p.q_rows; type = p.k_weight.type; if (p.k_bias) bias = p.k_bias[wrow]; }
+    else { w = p.v_weight.data; out = p.v_out + uint64_t(token) * p.kv_rows; wrow = row - p.q_rows - p.kv_rows; type = p.v_weight.type; if (p.v_bias) bias = p.v_bias[wrow]; }
+    float inv = 1.0f;
+    if (p.rms_norm) { float sum = 0; for (uint32_t k = 0; k < cols; ++k) sum += input[k] * input[k]; inv = 1.0f / sqrtf(sum / float(cols) + p.rms_epsilon); }
+    float acc = 0;
+    for (uint32_t k = 0; k < cols; ++k) { float xn = p.rms_norm ? input[k] * inv * p.rms_norm[k] : input[k]; acc += xn * decode::weight(type, w, uint64_t(wrow) * cols + k); }
+    out[wrow] = acc + bias;
+}
+void qkv(const QkvPlan& p, hipStream_t s) { hipLaunchKernelGGL(qkv_kernel, dim3((uint64_t(p.tokens) * (p.q_rows + 2 * p.kv_rows) + threads - 1) / threads), dim3(threads), 0, s, p); }
 void norm(const NormPlan& p, hipStream_t s) { hipLaunchKernelGGL(norm_kernel, dim3(p.rows), dim3(threads), 0, s, p); }
 void activation(const ActivationPlan& p, hipStream_t s) { hipLaunchKernelGGL(act_kernel, dim3(grid(p.elements)), dim3(threads), 0, s, p); }
 void add(const AddPlan& p, hipStream_t s) { hipLaunchKernelGGL(add_kernel, dim3(grid(p.elements)), dim3(threads), 0, s, p); }

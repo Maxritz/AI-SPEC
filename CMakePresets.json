@@ -1,0 +1,37 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "hip-release",
+      "displayName": "HIP Release (gfx1201)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-hip",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "G:/ROCM10RT-gfx1201/lib/llvm/bin/clang.exe",
+        "CMAKE_CXX_COMPILER": "G:/ROCM10RT-gfx1201/lib/llvm/bin/clang++.exe",
+        "CMAKE_HIP_COMPILER": "G:/ROCM10RT-gfx1201/lib/llvm/bin/amdclang++.exe",
+        "CMAKE_HIP_COMPILER_ROCM_ROOT": "G:/ROCM10RT-gfx1201",
+        "KNJ_ENABLE_HIP": "ON",
+        "KNJ_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "cpu-debug",
+      "displayName": "CPU Debug (portable tests)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "KNJ_ENABLE_HIP": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "hip-release",
+      "configurePreset": "hip-release"
+    }
+  ]
+}

@@ -63,6 +63,7 @@ public:
     void zero(void* p, uint64_t n, StreamId id) override { check(hipMemsetAsync(p, 0, host_size(n), stream(id)), "async zero"); }
     void empty(StreamId id) override { kernels::empty(stream(id)); launched(); }
     void matmul(const compute::MatmulPlan& p, StreamId id) override { compute::validate(p.weight); require(p.input && p.output && p.tokens && p.variant <= 3, "invalid HIP matmul"); require(p.variant != 2 || caps_.has_wmma, "WMMA is unavailable on this device"); kernels::matmul(p, stream(id)); launched(); }
+    void qkv(const compute::QkvPlan& p, StreamId id) override { require(p.input && p.q_out && p.k_out && p.v_out && p.q_rows && p.kv_rows && p.variant <= 3, "invalid HIP QKV"); kernels::qkv(p, stream(id)); launched(); }
     void router(const compute::RouterPlan& p, StreamId id) override { require(p.experts && p.experts <= 1024 && p.top_k && p.top_k <= p.experts && p.groups && p.groups <= 64 && p.experts % p.groups == 0 && p.groups_used && p.groups_used <= p.groups && p.top_k <= p.groups_used * (p.experts / p.groups), "invalid/unsupported HIP router geometry"); kernels::router(p, stream(id)); launched(); }
     void attention(const compute::AttentionPlan& p, StreamId id) override { require(p.block_tokens <= 128 && p.heads % p.kv_heads == 0 && p.head_dim && p.value_dim && p.block_offsets, "invalid paged HIP attention"); kernels::attention(p, stream(id)); launched(); }
 #define KNJ_HIP_OP(name, plan) void name(const compute::plan& p, StreamId id) override { kernels::name(p, stream(id)); launched(); }

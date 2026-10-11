@@ -5,6 +5,7 @@ namespace knj::kernels {
 void empty(hipStream_t);
 void capabilities(uint32_t*, hipStream_t);
 void matmul(const compute::MatmulPlan&, hipStream_t);
+void qkv(const compute::QkvPlan&, hipStream_t);
 void norm(const compute::NormPlan&, hipStream_t);
 void activation(const compute::ActivationPlan&, hipStream_t);
 void add(const compute::AddPlan&, hipStream_t);

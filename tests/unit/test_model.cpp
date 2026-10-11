@@ -489,7 +489,7 @@ int main() {
         cancellation_and_admission(plain, dir + "/plain.gguf", dir);
         speculation_identity(with_mtp, dir + "/mtp.gguf", dir);
         uint32_t seed = 77;
-        for (const char* arch : {"qwen3moe", "qwen2", "qwen2moe", "olmoe", "minimax-m2", "glm4moe",
+        for (const char* arch : {"qwen3moe", "qwen3", "qwen2", "qwen2moe", "olmoe", "minimax-m2", "glm4moe",
                                  "qwen35", "qwen35moe", "qwen3next"})
             family_suite(arch, dir, seed++);
         // Gated DeltaNet op contracts, the ffn_norm alias fallback, and the full quant ladder.

@@ -61,7 +61,7 @@ public:
     void zero(void* dst, uint64_t n, StreamId id) override { stream(id).push([dst, n] { std::memset(dst, 0, host_size(n)); }); }
     void empty(StreamId id) override { stream(id).push([] {}); }
 #define KNJ_CPU_OP(name, plan) void name(const compute::plan& p, StreamId id) override { stream(id).push([p] { compute::name(p); }); }
-    KNJ_CPU_OP(matmul, MatmulPlan) KNJ_CPU_OP(norm, NormPlan) KNJ_CPU_OP(activation, ActivationPlan)
+    KNJ_CPU_OP(matmul, MatmulPlan) KNJ_CPU_OP(qkv, QkvPlan) KNJ_CPU_OP(norm, NormPlan) KNJ_CPU_OP(activation, ActivationPlan)
     KNJ_CPU_OP(add, AddPlan) KNJ_CPU_OP(embed, EmbedPlan) KNJ_CPU_OP(rearrange, RearrangePlan) KNJ_CPU_OP(rope, RopePlan) KNJ_CPU_OP(router, RouterPlan)
     KNJ_CPU_OP(expert, ExpertPlan) KNJ_CPU_OP(accumulate, AccumulatePlan) KNJ_CPU_OP(kv_write, KvWritePlan)
     KNJ_CPU_OP(attention, AttentionPlan) KNJ_CPU_OP(attention_init, AttentionPlan)

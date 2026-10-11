@@ -24,10 +24,36 @@ float activate(float x, Activation a) {
 }
 void matmul(const MatmulPlan& p) {
     validate(p.weight); require(p.tokens && p.input && p.output, "invalid matmul plan");
-    for (uint32_t t = 0; t < p.tokens; ++t) for (uint32_t r = 0; r < p.weight.rows; ++r) {
-        float sum = 0; uint64_t base = uint64_t(r) * p.weight.cols;
-        for (uint32_t k = 0; k < p.weight.cols; ++k) sum += p.input[uint64_t(t) * p.weight.cols + k] * decode::weight(p.weight.type, p.weight.data, base + k);
-        p.output[uint64_t(t) * p.weight.rows + r] = sum + (p.bias ? p.bias[r] : 0);
+    for (uint32_t t = 0; t < p.tokens; ++t) {
+        float inv = 1.0f;
+        if (p.rms_norm) { float sum = 0; for (uint32_t k = 0; k < p.weight.cols; ++k) sum += p.input[uint64_t(t) * p.weight.cols + k] * p.input[uint64_t(t) * p.weight.cols + k]; inv = 1.0f / std::sqrt(sum / p.weight.cols + p.rms_epsilon); }
+        for (uint32_t r = 0; r < p.weight.rows; ++r) {
+            float sum = 0; uint64_t base = uint64_t(r) * p.weight.cols; uint64_t in_base = uint64_t(t) * p.weight.cols;
+            for (uint32_t k = 0; k < p.weight.cols; ++k) sum += (p.rms_norm ? p.input[in_base + k] * inv * p.rms_norm[k] : p.input[in_base + k]) * decode::weight(p.weight.type, p.weight.data, base + k);
+            p.output[uint64_t(t) * p.weight.rows + r] = sum + (p.bias ? p.bias[r] : 0) + (p.residual ? p.residual[uint64_t(t) * p.weight.rows + r] : 0);
+        }
+    }
+}
+void qkv(const QkvPlan& p) {
+    require(p.input && p.q_out && p.k_out && p.v_out && p.q_rows && p.kv_rows, "invalid QKV plan");
+    uint32_t cols = p.q_weight.cols;
+    for (uint32_t t = 0; t < p.tokens; ++t) {
+        float inv = 1.0f;
+        if (p.rms_norm) { float sum = 0; for (uint32_t k = 0; k < cols; ++k) sum += p.input[uint64_t(t) * cols + k] * p.input[uint64_t(t) * cols + k]; inv = 1.0f / std::sqrt(sum / cols + p.rms_epsilon); }
+        uint64_t in_base = uint64_t(t) * cols;
+        for (uint32_t r = 0; r < p.q_rows; ++r) {
+            float sum = 0; uint64_t base = uint64_t(r) * cols;
+            for (uint32_t k = 0; k < cols; ++k) sum += (p.rms_norm ? p.input[in_base + k] * inv * p.rms_norm[k] : p.input[in_base + k]) * decode::weight(p.q_weight.type, p.q_weight.data, base + k);
+            p.q_out[uint64_t(t) * p.q_rows + r] = sum + (p.bias ? p.bias[r] : 0);
+        }
+        for (uint32_t r = 0; r < p.kv_rows; ++r) {
+            float sum = 0; uint64_t base = uint64_t(r) * cols;
+            for (uint32_t k = 0; k < cols; ++k) sum += (p.rms_norm ? p.input[in_base + k] * inv * p.rms_norm[k] : p.input[in_base + k]) * decode::weight(p.k_weight.type, p.k_weight.data, base + k);
+            p.k_out[uint64_t(t) * p.kv_rows + r] = sum + (p.k_bias ? p.k_bias[r] : 0);
+            sum = 0;
+            for (uint32_t k = 0; k < cols; ++k) sum += (p.rms_norm ? p.input[in_base + k] * inv * p.rms_norm[k] : p.input[in_base + k]) * decode::weight(p.v_weight.type, p.v_weight.data, base + k);
+            p.v_out[uint64_t(t) * p.kv_rows + r] = sum + (p.v_bias ? p.v_bias[r] : 0);
+        }
     }
 }
 void norm(const NormPlan& p) {
